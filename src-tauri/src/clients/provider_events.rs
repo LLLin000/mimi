@@ -5,6 +5,7 @@
 //! one-shot control signal forces generation recovery instead of silently
 //! dropping a final or growing an unbounded queue.
 
+use crate::core::models::UtteranceRole;
 use crate::core::protocols::live_translate::LiveTranslateServerEvent;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -148,6 +149,26 @@ impl ProviderEventSender {
                     return Err(ProviderEventSendError::Closed);
                 }
                 self.inner.translation_draft.send_replace(Some(event));
+                Ok(())
+            }
+            // Stamped drafts must land on the same latest-value lanes as the
+            // unstamped drafts they replace: otherwise every intermediate
+            // recognition or translation update would occupy the bounded
+            // reliable lane and could starve finals and lifecycle events.
+            // Only finals stay on the reliable lane.
+            LiveTranslateServerEvent::UtteranceText {
+                role,
+                is_final: false,
+                ..
+            } => {
+                let lane = match role {
+                    UtteranceRole::Source => &self.inner.source_draft,
+                    UtteranceRole::Translation => &self.inner.translation_draft,
+                };
+                if lane.receiver_count() == 0 {
+                    return Err(ProviderEventSendError::Closed);
+                }
+                lane.send_replace(Some(event));
                 Ok(())
             }
             _ => match self.inner.reliable.try_send(event) {
@@ -512,5 +533,94 @@ mod tests {
         assert_eq!(code, OVERFLOW_CODE);
         assert!(!message.contains("subtitle"));
         assert!(!message.contains("translation text"));
+    }
+
+    fn stamped_draft(
+        utterance_id: &str,
+        role: UtteranceRole,
+        text: &str,
+    ) -> LiveTranslateServerEvent {
+        LiveTranslateServerEvent::UtteranceText {
+            utterance_id: utterance_id.into(),
+            role,
+            text: text.into(),
+            is_final: false,
+            language: None,
+        }
+    }
+
+    #[test]
+    fn stamped_drafts_use_the_latest_value_lanes() {
+        let (sender, mut receiver) = provider_event_channel();
+        // Far more drafts than the reliable lane could hold: an accidental
+        // reliable-lane send would fill it and fail with Backpressure.
+        for index in 0..200 {
+            sender
+                .send(stamped_draft(
+                    &format!("source_{index}"),
+                    UtteranceRole::Source,
+                    &format!("source draft {index}"),
+                ))
+                .unwrap();
+            sender
+                .send(stamped_draft(
+                    &format!("source_{index}"),
+                    UtteranceRole::Translation,
+                    &format!("译文草稿 {index}"),
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(stamped_draft(
+                "source_199",
+                UtteranceRole::Source,
+                "source draft 199"
+            ))
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(stamped_draft(
+                "source_199",
+                UtteranceRole::Translation,
+                "译文草稿 199"
+            ))
+        );
+        assert_eq!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn stamped_finals_stay_on_the_reliable_lane() {
+        let (sender, mut receiver) = provider_event_channel();
+        for index in 0..200 {
+            sender
+                .send(stamped_draft(
+                    &format!("source_{index}"),
+                    UtteranceRole::Source,
+                    &format!("draft {index}"),
+                ))
+                .unwrap();
+        }
+
+        let source_final = LiveTranslateServerEvent::UtteranceText {
+            utterance_id: "source_199".into(),
+            role: UtteranceRole::Source,
+            text: "final".into(),
+            is_final: true,
+            language: Some("en".into()),
+        };
+        let pair = LiveTranslateServerEvent::SubtitleFinalPair {
+            source: "final".into(),
+            language: Some("en".into()),
+            translation: "定稿".into(),
+        };
+        sender.send(source_final.clone()).unwrap();
+        sender.send(pair.clone()).unwrap();
+
+        assert_eq!(receiver.try_recv(), Ok(source_final));
+        assert_eq!(receiver.try_recv(), Ok(pair));
+        // The draft published before them cannot resurface after the final.
+        assert_eq!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     }
 }

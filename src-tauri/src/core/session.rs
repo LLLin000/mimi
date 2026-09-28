@@ -1,6 +1,6 @@
 //! Provider-neutral session state controller.
 
-use crate::core::models::{DetectedLanguage, SessionStatus, SubtitleSnapshot};
+use crate::core::models::{DetectedLanguage, SessionStatus, SubtitleSnapshot, UtteranceRole};
 use crate::core::protocols::live_translate::LiveTranslateServerEvent;
 use crate::core::subtitle_reducer::SubtitleReducer;
 
@@ -120,6 +120,24 @@ impl TranslationSessionController {
             LiveTranslateServerEvent::TranslationDraft(text) => {
                 self.subtitle_reducer
                     .apply(crate::core::models::SubtitleEvent::TranslationDraft(text));
+            }
+            LiveTranslateServerEvent::UtteranceText {
+                utterance_id,
+                role,
+                text,
+                is_final,
+                language,
+            } => {
+                if role == UtteranceRole::Source {
+                    self.update_detected_language(language.as_deref());
+                }
+                self.subtitle_reducer
+                    .apply(crate::core::models::SubtitleEvent::UtteranceText {
+                        utterance_id,
+                        role,
+                        text,
+                        is_final,
+                    });
             }
             LiveTranslateServerEvent::TranslationFinal(text) => {
                 self.state.is_translation_pending = false;
@@ -392,6 +410,48 @@ mod tests {
         assert_eq!(controller.state.subtitles.history.len(), 1);
         assert_eq!(controller.state.subtitles.history[0].source, "Hello.");
         assert_eq!(controller.state.subtitles.history[0].translation, "你好。");
+        assert_eq!(
+            controller
+                .state
+                .detected_language
+                .as_ref()
+                .map(|value| value.code.as_str()),
+            Some("en")
+        );
+    }
+
+    #[test]
+    fn stamped_utterance_text_reaches_the_snapshot_with_its_identity() {
+        let mut controller = TranslationSessionController::default();
+        controller.did_connect();
+        controller.handle(LiveTranslateServerEvent::UtteranceText {
+            utterance_id: "item_source".into(),
+            role: UtteranceRole::Source,
+            text: "Hello.".into(),
+            is_final: true,
+            language: Some("en".into()),
+        });
+        controller.handle(LiveTranslateServerEvent::UtteranceText {
+            utterance_id: "item_source".into(),
+            role: UtteranceRole::Translation,
+            text: "你好。".into(),
+            is_final: false,
+            language: None,
+        });
+
+        assert_eq!(
+            controller.state.subtitles.source.utterance_id.as_deref(),
+            Some("item_source")
+        );
+        assert_eq!(
+            controller
+                .state
+                .subtitles
+                .translation
+                .utterance_id
+                .as_deref(),
+            Some("item_source")
+        );
         assert_eq!(
             controller
                 .state

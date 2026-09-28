@@ -11,7 +11,7 @@ use crate::audio::{
 use crate::clients::provider_events::provider_event_channel;
 use crate::clients::translation_client::TranslationClient;
 use crate::core::configuration::LiveTranslationConfiguration;
-use crate::core::models::{SessionStatus, SourceLanguage, TranslationMode};
+use crate::core::models::{SessionStatus, SourceLanguage, TranslationMode, UtteranceRole};
 use crate::core::protocols::live_translate::LiveTranslateServerEvent;
 use crate::core::provider::ProviderKind;
 use crate::core::session::{TranslationSessionController, TranslationSessionState};
@@ -1628,6 +1628,11 @@ impl SessionManager {
             event,
             LiveTranslateServerEvent::TranslationFinal(_)
                 | LiveTranslateServerEvent::SubtitleFinalPair { .. }
+                | LiveTranslateServerEvent::UtteranceText {
+                    role: UtteranceRole::Translation,
+                    is_final: true,
+                    ..
+                }
                 | LiveTranslateServerEvent::Error { .. }
         ) {
             self.cancel_translation_timeout();

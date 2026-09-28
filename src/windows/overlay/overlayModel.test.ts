@@ -409,4 +409,33 @@ describe("bilingual preview rows", () => {
       { sourceLanguage, targetLanguage, subtitleDisplayMode: "bilingual" }, detectedLanguage, false, false,
     )).toEqual([{ text: "今日は晴れ", isFinal: false, kind: "source" }]);
   });
+
+  it("stacks previews only while both lines belong to the same utterance", () => {
+    const streaming = (sourceUtterance: string | null, translationUtterance: string | null) =>
+      subtitles(
+        { text: "Next sentence", isFinal: false, utteranceId: sourceUtterance },
+        { text: "下一句", isFinal: false, utteranceId: translationUtterance },
+      );
+    const bilingual = { ...settings, subtitleDisplayMode: "bilingual" } as const;
+
+    expect(visibleLiveSubtitles(streaming("item_a", "item_a"), bilingual, "en", false, false)).toEqual([
+      { text: "Next sentence", isFinal: false, kind: "source" },
+      { text: "下一句", isFinal: false, kind: "translation" },
+    ]);
+    // The translation still answers the previous sentence: the original stays
+    // alone instead of pairing the two streams by arrival order.
+    expect(visibleLiveSubtitles(streaming("item_b", "item_a"), bilingual, "en", false, false)).toEqual([
+      { text: "Next sentence", isFinal: false, kind: "source" },
+    ]);
+    // A translation whose utterance is unknown must not stack either: it can
+    // still be the previous sentence's text.
+    expect(visibleLiveSubtitles(streaming("item_b", null), bilingual, "en", false, false)).toEqual([
+      { text: "Next sentence", isFinal: false, kind: "source" },
+    ]);
+    // Providers without utterance identity keep stacking both streams.
+    expect(visibleLiveSubtitles(streaming(null, null), bilingual, "en", false, false)).toEqual([
+      { text: "Next sentence", isFinal: false, kind: "source" },
+      { text: "下一句", isFinal: false, kind: "translation" },
+    ]);
+  });
 });

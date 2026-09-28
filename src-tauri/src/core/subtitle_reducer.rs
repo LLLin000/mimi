@@ -7,7 +7,9 @@
 //! best-effort path for a stream without identity: the translation is paired
 //! with the recognition line currently on screen.
 
-use crate::core::models::{SubtitleEvent, SubtitleLine, SubtitlePair, SubtitleSnapshot};
+use crate::core::models::{
+    SubtitleEvent, SubtitleLine, SubtitlePair, SubtitleSnapshot, UtteranceRole,
+};
 
 pub struct SubtitleReducer {
     pub snapshot: SubtitleSnapshot,
@@ -39,6 +41,31 @@ impl SubtitleReducer {
                     return;
                 }
                 self.snapshot.translation = SubtitleLine::new(trimmed, false);
+            }
+            SubtitleEvent::UtteranceText {
+                utterance_id,
+                role,
+                text,
+                is_final,
+            } => {
+                let text = trim(&text);
+                match role {
+                    UtteranceRole::Source => {
+                        self.snapshot.source =
+                            SubtitleLine::for_utterance(text, is_final, utterance_id);
+                    }
+                    UtteranceRole::Translation => {
+                        if text.is_empty() && self.snapshot.translation.is_final {
+                            return;
+                        }
+                        self.snapshot.translation =
+                            SubtitleLine::for_utterance(text.clone(), is_final, utterance_id);
+                        if is_final {
+                            let source = self.snapshot.source.text.clone();
+                            self.append_history_if_possible(source, text);
+                        }
+                    }
+                }
             }
             SubtitleEvent::TranslationFinal(text) => {
                 let translation = trim(&text);
@@ -381,6 +408,66 @@ mod tests {
         assert_eq!(
             reducer.snapshot.translation,
             SubtitleLine::new("你好。", true)
+        );
+    }
+
+    #[test]
+    fn stamped_text_keeps_one_utterance_identity_on_both_lines() {
+        let mut reducer = SubtitleReducer::default();
+        reducer.apply(SubtitleEvent::UtteranceText {
+            utterance_id: "item_source".into(),
+            role: UtteranceRole::Source,
+            text: "Hello.".into(),
+            is_final: true,
+        });
+        reducer.apply(SubtitleEvent::UtteranceText {
+            utterance_id: "item_source".into(),
+            role: UtteranceRole::Translation,
+            text: "你好。".into(),
+            is_final: false,
+        });
+
+        assert_eq!(
+            reducer.snapshot.source.utterance_id.as_deref(),
+            Some("item_source")
+        );
+        assert_eq!(
+            reducer.snapshot.translation.utterance_id.as_deref(),
+            Some("item_source")
+        );
+        assert!(reducer.snapshot.history.is_empty());
+
+        reducer.apply(SubtitleEvent::UtteranceText {
+            utterance_id: "item_source".into(),
+            role: UtteranceRole::Translation,
+            text: "你好。".into(),
+            is_final: true,
+        });
+        assert_eq!(
+            reducer.snapshot.history,
+            vec![SubtitlePair::new("Hello.".into(), "你好。".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn stamped_blank_draft_does_not_overwrite_confirmed_final() {
+        let mut reducer = SubtitleReducer::default();
+        reducer.apply(SubtitleEvent::UtteranceText {
+            utterance_id: "item_source".into(),
+            role: UtteranceRole::Translation,
+            text: "你好。".into(),
+            is_final: true,
+        });
+        reducer.apply(SubtitleEvent::UtteranceText {
+            utterance_id: "item_source".into(),
+            role: UtteranceRole::Translation,
+            text: "   ".into(),
+            is_final: false,
+        });
+
+        assert_eq!(
+            reducer.snapshot.translation,
+            SubtitleLine::for_utterance("你好。", true, "item_source".into())
         );
     }
 }

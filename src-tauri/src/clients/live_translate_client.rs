@@ -2,7 +2,7 @@
 
 use crate::clients::provider_events::ProviderEventSender;
 use crate::core::diagnostics::milliseconds;
-use crate::core::models::{SourceLanguage, TargetLanguage};
+use crate::core::models::{SourceLanguage, TargetLanguage, UtteranceRole};
 use crate::core::protocols::live_translate::{
     LiveTranslateEndpoint, LiveTranslateEventIdentity, LiveTranslateRequestEncoder,
     LiveTranslateServerEvent,
@@ -377,11 +377,32 @@ impl LiveTranslatePairAligner {
                 utterance.source_text = text.clone();
                 utterance.source_language = language.clone();
                 utterance.source_final |= is_final;
-                events.push(event.clone());
+                events.push(LiveTranslateServerEvent::UtteranceText {
+                    utterance_id: item_id.to_string(),
+                    role: UtteranceRole::Source,
+                    text: text.clone(),
+                    is_final,
+                    language: language.clone(),
+                });
                 if is_final {
                     events.extend(self.take_pair(item_id, false));
                 }
                 events
+            }
+            LiveTranslateServerEvent::TranslationDraft(text) => {
+                let Some(response_id) = identity.item_id.as_deref() else {
+                    return vec![event.clone()];
+                };
+                let Some(source_id) = self.responses.get(response_id).cloned() else {
+                    return vec![event.clone()];
+                };
+                vec![LiveTranslateServerEvent::UtteranceText {
+                    utterance_id: source_id,
+                    role: UtteranceRole::Translation,
+                    text: text.clone(),
+                    is_final: false,
+                    language: None,
+                }]
             }
             LiveTranslateServerEvent::TranslationFinal(text) => {
                 let Some(response_id) = identity.item_id.as_deref() else {
@@ -571,7 +592,16 @@ fn emit_server_event(
 
     // The stream protocol has no "translation started" message: the source
     // final is the reliable boundary at which translation begins.
-    if matches!(event, LiveTranslateServerEvent::SourceFinal { .. })
+    let source_final_arrived = matches!(
+        &event,
+        LiveTranslateServerEvent::SourceFinal { .. }
+            | LiveTranslateServerEvent::UtteranceText {
+                role: UtteranceRole::Source,
+                is_final: true,
+                ..
+            }
+    );
+    if source_final_arrived
         && events
             .send(LiveTranslateServerEvent::TranslationStarted)
             .is_err()
@@ -611,6 +641,7 @@ fn should_report_transport_end(received_session_finished: bool) -> bool {
 mod tests {
     use super::*;
     use crate::clients::provider_events::provider_event_channel;
+    use std::collections::HashSet;
 
     #[test]
     fn interrupted_send_timings_distinguish_lock_wait_from_socket_wait() {
@@ -762,8 +793,11 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                LiveTranslateServerEvent::SourceFinal {
+                LiveTranslateServerEvent::UtteranceText {
+                    utterance_id: "item_source".into(),
+                    role: UtteranceRole::Source,
                     text: "Hello.".into(),
+                    is_final: true,
                     language: Some("en".into()),
                 },
                 LiveTranslateServerEvent::SubtitleFinalPair {
@@ -792,8 +826,11 @@ mod tests {
         );
         assert_eq!(
             events,
-            vec![LiveTranslateServerEvent::SourceFinal {
+            vec![LiveTranslateServerEvent::UtteranceText {
+                utterance_id: "item_source".into(),
+                role: UtteranceRole::Source,
                 text: "Hello.".into(),
+                is_final: true,
                 language: None,
             }]
         );
@@ -820,18 +857,35 @@ mod tests {
             &identity("item_response", Some("item_source")),
         );
 
-        let source_draft = LiveTranslateServerEvent::SourceDraft {
-            text: "Hello wor".into(),
-            language: Some("en".into()),
-        };
         assert_eq!(
-            aligner.observe(&source_draft, &identity("item_source", None)),
-            vec![source_draft.clone()]
+            aligner.observe(
+                &LiveTranslateServerEvent::SourceDraft {
+                    text: "Hello wor".into(),
+                    language: Some("en".into()),
+                },
+                &identity("item_source", None),
+            ),
+            vec![LiveTranslateServerEvent::UtteranceText {
+                utterance_id: "item_source".into(),
+                role: UtteranceRole::Source,
+                text: "Hello wor".into(),
+                is_final: false,
+                language: Some("en".into()),
+            }]
         );
-        let translation_draft = LiveTranslateServerEvent::TranslationDraft("你好".into());
+        // A translation draft is stamped with the source utterance it answers.
         assert_eq!(
-            aligner.observe(&translation_draft, &identity("item_response", None)),
-            vec![translation_draft.clone()]
+            aligner.observe(
+                &LiveTranslateServerEvent::TranslationDraft("你好".into()),
+                &identity("item_response", None),
+            ),
+            vec![LiveTranslateServerEvent::UtteranceText {
+                utterance_id: "item_source".into(),
+                role: UtteranceRole::Translation,
+                text: "你好".into(),
+                is_final: false,
+                language: None,
+            }]
         );
         assert!(aligner
             .observe(
@@ -839,13 +893,21 @@ mod tests {
                 &identity("item_response", None),
             )
             .is_empty());
-        let later_draft = LiveTranslateServerEvent::SourceDraft {
-            text: "Hello world".into(),
-            language: Some("en".into()),
-        };
         assert_eq!(
-            aligner.observe(&later_draft, &identity("item_source", None)),
-            vec![later_draft.clone()]
+            aligner.observe(
+                &LiveTranslateServerEvent::SourceDraft {
+                    text: "Hello world".into(),
+                    language: Some("en".into()),
+                },
+                &identity("item_source", None),
+            ),
+            vec![LiveTranslateServerEvent::UtteranceText {
+                utterance_id: "item_source".into(),
+                role: UtteranceRole::Source,
+                text: "Hello world".into(),
+                is_final: false,
+                language: Some("en".into()),
+            }]
         );
 
         // The pair keeps the authoritative recognition final, never a draft.
@@ -859,8 +921,11 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                LiveTranslateServerEvent::SourceFinal {
+                LiveTranslateServerEvent::UtteranceText {
+                    utterance_id: "item_source".into(),
+                    role: UtteranceRole::Source,
                     text: "Hello world.".into(),
+                    is_final: true,
                     language: Some("en".into()),
                 },
                 LiveTranslateServerEvent::SubtitleFinalPair {
@@ -955,8 +1020,11 @@ mod tests {
                     language: None,
                     translation: "你好。".into(),
                 },
-                LiveTranslateServerEvent::SourceDraft {
+                LiveTranslateServerEvent::UtteranceText {
+                    utterance_id: "item_source_2".into(),
+                    role: UtteranceRole::Source,
                     text: "Next utterance".into(),
+                    is_final: false,
                     language: None,
                 },
             ]
@@ -992,6 +1060,44 @@ mod tests {
                 source: "First sentence.".into(),
                 language: Some("en".into()),
                 translation: "第一句。".into(),
+            }]
+        );
+    }
+
+    /// The cross-sentence case above, for the streaming side: a draft that
+    /// arrives after the recognition stream moved on is still stamped with its
+    /// own source, so the bilingual preview refuses to stack it under the next
+    /// sentence's original.
+    #[test]
+    fn a_late_translation_draft_keeps_the_identity_of_its_own_source() {
+        let mut aligner = LiveTranslatePairAligner::default();
+        aligner.observe(&created_item(), &identity("response_a", Some("source_a")));
+        aligner.observe(
+            &LiveTranslateServerEvent::SourceFinal {
+                text: "First sentence.".into(),
+                language: Some("en".into()),
+            },
+            &identity("source_a", None),
+        );
+        aligner.observe(
+            &LiveTranslateServerEvent::SourceDraft {
+                text: "Second sentence".into(),
+                language: Some("en".into()),
+            },
+            &identity("source_b", None),
+        );
+
+        assert_eq!(
+            aligner.observe(
+                &LiveTranslateServerEvent::TranslationDraft("第一句".into()),
+                &identity("response_a", None),
+            ),
+            vec![LiveTranslateServerEvent::UtteranceText {
+                utterance_id: "source_a".into(),
+                role: UtteranceRole::Translation,
+                text: "第一句".into(),
+                is_final: false,
+                language: None,
             }]
         );
     }
@@ -1110,15 +1216,40 @@ mod tests {
         let mut pairs = Vec::new();
         let (mut source_drafts, mut translation_drafts) = (0, 0);
         let (mut source_finals, mut translation_finals) = (0, 0);
+        let mut source_utterances = HashSet::new();
+        let mut translation_utterances = HashSet::new();
         for event in fixture["events"].as_array().unwrap() {
             let (decoded, identity) = LiveTranslateServerEvent::decode_value_with_identity(event)
                 .expect("the capture only contains documented events");
             for forwarded in aligner.observe(&decoded, &identity) {
                 match forwarded {
-                    LiveTranslateServerEvent::SourceDraft { .. } => source_drafts += 1,
-                    LiveTranslateServerEvent::TranslationDraft(_) => translation_drafts += 1,
-                    LiveTranslateServerEvent::SourceFinal { .. } => source_finals += 1,
-                    LiveTranslateServerEvent::TranslationFinal(_) => translation_finals += 1,
+                    LiveTranslateServerEvent::UtteranceText {
+                        utterance_id,
+                        role,
+                        is_final,
+                        ..
+                    } => {
+                        match (role, is_final) {
+                            (UtteranceRole::Source, false) => source_drafts += 1,
+                            (UtteranceRole::Source, true) => source_finals += 1,
+                            (UtteranceRole::Translation, false) => translation_drafts += 1,
+                            (UtteranceRole::Translation, true) => translation_finals += 1,
+                        }
+                        match role {
+                            UtteranceRole::Source => {
+                                source_utterances.insert(utterance_id);
+                            }
+                            UtteranceRole::Translation => {
+                                translation_utterances.insert(utterance_id);
+                            }
+                        }
+                    }
+                    LiveTranslateServerEvent::SourceDraft { .. }
+                    | LiveTranslateServerEvent::SourceFinal { .. }
+                    | LiveTranslateServerEvent::TranslationDraft(_)
+                    | LiveTranslateServerEvent::TranslationFinal(_) => {
+                        panic!("identity-carrying text must be stamped: {forwarded:?}")
+                    }
                     LiveTranslateServerEvent::SubtitleFinalPair {
                         source,
                         translation,
@@ -1129,8 +1260,12 @@ mod tests {
             }
         }
 
+        // Drafts keep streaming exactly as the provider emits them, now stamped
+        // with the utterance they belong to.
         assert_eq!((source_drafts, translation_drafts), (72, 77));
         assert_eq!((source_finals, translation_finals), (8, 0));
+        assert_eq!(source_utterances.len(), 8);
+        assert!(translation_utterances.is_subset(&source_utterances));
         assert_eq!(
             pairs,
             vec![

@@ -346,6 +346,12 @@ pub struct SubtitleLine {
     pub text: String,
     #[serde(rename = "isFinal")]
     pub is_final: bool,
+    /// The provider utterance this line belongs to, when the provider identifies
+    /// its utterances. Both preview lines of one utterance carry the *source*
+    /// item id, so presentation can refuse to stack a translation under the next
+    /// sentence's original.
+    #[serde(rename = "utteranceId")]
+    pub utterance_id: Option<String>,
 }
 
 impl SubtitleLine {
@@ -353,6 +359,16 @@ impl SubtitleLine {
         Self {
             text: text.into(),
             is_final,
+            utterance_id: None,
+        }
+    }
+
+    /// The same line stamped with the provider utterance it belongs to.
+    pub fn for_utterance(text: impl Into<String>, is_final: bool, utterance_id: String) -> Self {
+        Self {
+            text: text.into(),
+            is_final,
+            utterance_id: Some(utterance_id),
         }
     }
 }
@@ -413,6 +429,15 @@ pub enum SubtitleEvent {
     SourceFinal(String),
     TranslationDraft(String),
     TranslationFinal(String),
+    /// Text from a provider that identifies its utterances. `role` selects the
+    /// preview line and `utterance_id` is always the *source* utterance id, so
+    /// both lines of one utterance carry the same identity.
+    UtteranceText {
+        utterance_id: String,
+        role: UtteranceRole,
+        text: String,
+        is_final: bool,
+    },
     /// Commits a source/translation pair as one reducer operation. Providers
     /// whose two append-only streams are aligned client-side use this event so
     /// finals from different connection generations can never be cross-paired.
@@ -421,6 +446,13 @@ pub enum SubtitleEvent {
         translation: String,
     },
     Clear,
+}
+
+/// Which preview line a stamped provider text belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtteranceRole {
+    Source,
+    Translation,
 }
 
 #[cfg(test)]

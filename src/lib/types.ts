@@ -21,6 +21,9 @@ type SessionStatus =
 interface SubtitleLineSnapshot {
   text: string;
   isFinal: boolean;
+  /** Provider utterance this line belongs to. Both lines of one utterance
+   * carry the source id, so previews only stack lines of the same sentence. */
+  utteranceId?: string | null;
 }
 
 interface SubtitleHistoryItem {

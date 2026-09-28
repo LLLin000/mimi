@@ -334,6 +334,18 @@ export function visibleLiveSubtitles(
   if (subtitles.translation.text.trim() === subtitles.source.text.trim()) {
     return previews;
   }
+  // Providers that identify their utterances stamp both lines with the source
+  // id. Stack only when the stamps agree, or when neither line carries one:
+  // a translation whose utterance is unknown (or a different one) still answers
+  // the previous sentence, so the original stays alone until its own arrives.
+  const sourceUtterance = subtitles.source.utteranceId ?? null;
+  const translationUtterance = subtitles.translation.utteranceId ?? null;
+  const bothUnstamped = sourceUtterance === null && translationUtterance === null;
+  const sameUtterance =
+    sourceUtterance !== null && sourceUtterance === translationUtterance;
+  if (!bothUnstamped && !sameUtterance) {
+    return previews;
+  }
   return [...previews, { ...translation, kind: "translation" }];
 }
 

@@ -2,7 +2,7 @@
 //! endpoint. Authentication uses a Bearer API key; the URL has no Workspace
 //! ID component.
 
-use crate::core::models::{SourceLanguage, TargetLanguage};
+use crate::core::models::{SourceLanguage, TargetLanguage, UtteranceRole};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -122,6 +122,17 @@ pub enum LiveTranslateServerEvent {
     TranslationStarted,
     TranslationDraft(String),
     TranslationFinal(String),
+    /// Text stamped with the provider utterance it belongs to. `utterance_id` is
+    /// always the *source* item: a translation's response item is resolved
+    /// through `previous_item_id` before it reaches this event, so both preview
+    /// lines of one utterance share the same identity.
+    UtteranceText {
+        utterance_id: String,
+        role: UtteranceRole,
+        text: String,
+        is_final: bool,
+        language: Option<String>,
+    },
     SubtitleFinalPair {
         source: String,
         language: Option<String>,
