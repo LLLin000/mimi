@@ -276,6 +276,9 @@ jobs:
       - name: Test quick-check argument safety
         run: bash scripts/check-quick-test.sh
 
+      - name: Test signed watch preview configuration
+        run: node --test scripts/dev-app-watch.node.mjs
+
       - name: Shared native packaging invariants
         run: python3 -B scripts/shared-core-native-test.py
 

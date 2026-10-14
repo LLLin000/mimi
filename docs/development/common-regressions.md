@@ -39,6 +39,10 @@ Rules:
   `CARGO_TARGET_DIR` selects both the binary and temporary bundle location.
   A fresh cache builds the existing SpeexDSP echo-cancellation dependency and
   needs CMake on `PATH`, or an explicit `CMAKE=/absolute/path/to/cmake`.
+- The signed watch launcher must explicitly load `config/vite.config.ts`.
+  Vite's default root-file discovery misses the relocated configuration, so
+  React setup and development flags are absent and the native preview is blank.
+  The watch-server regression checks the real transformed entry and flags.
 - Serialize `check.sh`, `dev-app.sh`, `prepare-macos-release.sh` and other
   frontend builds in one checkout. They write the same `dist` directory even
   when Cargo target directories differ. Concurrent writes can remove a CSS or

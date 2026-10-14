@@ -25,6 +25,7 @@ fi
 
 bash "$SCRIPT_DIR/check-quick-test.sh"
 bash "$SCRIPT_DIR/dev-app-launch-test.sh"
+node --test "$SCRIPT_DIR/dev-app-watch.node.mjs"
 bash "$SCRIPT_DIR/check-apple-translation.sh"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
