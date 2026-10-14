@@ -55,10 +55,13 @@ export function LanguageStatusCapsule({
     const capsule = capsuleRef.current;
     if (expanded || !onWidthChange || !capsule) return;
     let lastWidth = 0;
+    let lastPixelRatio = 0;
     const measure = () => {
       const width = Math.ceil(capsule.getBoundingClientRect().width);
-      if (width <= 0 || width === lastWidth) return;
+      const pixelRatio = window.devicePixelRatio;
+      if (width <= 0 || (width === lastWidth && pixelRatio === lastPixelRatio)) return;
       lastWidth = width;
+      lastPixelRatio = pixelRatio;
       onWidthChange(width);
     };
     // max-content makes this independent of the previous native window size.
@@ -66,7 +69,11 @@ export function LanguageStatusCapsule({
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(capsule);
-    return () => observer.disconnect();
+    window.addEventListener("resize", measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measure);
+    };
   }, [expanded, onWidthChange]);
 
   return (

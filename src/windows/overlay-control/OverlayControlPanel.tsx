@@ -119,6 +119,8 @@ export function OverlayControlPanel({
     if (!isTauri || !panelRef.current || !contentRef.current) return;
     let animationFrame = 0;
     let lastHeight = 0;
+    let lastPixelRatio = 0;
+    let initialResize = true;
     const measure = () => {
       animationFrame = 0;
       const panel = panelRef.current;
@@ -127,9 +129,18 @@ export function OverlayControlPanel({
       const height = Math.ceil(
         content.getBoundingClientRect().height + panel.clientTop * 2,
       );
-      if (height === lastHeight) return;
+      const pixelRatio = window.devicePixelRatio;
+      if (height === lastHeight && pixelRatio === lastPixelRatio) return;
       lastHeight = height;
-      void overlayControlSetPanelHeight(height).catch(() => {});
+      lastPixelRatio = pixelRatio;
+      void overlayControlSetPanelHeight(height).then(() => {
+        if (!initialResize) return;
+        initialResize = false;
+        const focused = document.activeElement;
+        if (focused instanceof HTMLElement && panelRef.current?.contains(focused)) {
+          focused.scrollIntoView({ block: "nearest" });
+        }
+      }).catch(() => {});
     };
     const scheduleMeasure = () => {
       if (animationFrame !== 0) return;
@@ -137,9 +148,11 @@ export function OverlayControlPanel({
     };
     const observer = new ResizeObserver(scheduleMeasure);
     observer.observe(contentRef.current);
+    window.addEventListener("resize", scheduleMeasure);
     scheduleMeasure();
     return () => {
       observer.disconnect();
+      window.removeEventListener("resize", scheduleMeasure);
       if (animationFrame !== 0) window.cancelAnimationFrame(animationFrame);
     };
   }, []);
@@ -152,7 +165,11 @@ export function OverlayControlPanel({
       immersiveRef.current,
       lockRef.current,
     ].find((candidate) => candidate != null && !candidate.disabled);
-    const animationFrame = window.requestAnimationFrame(() => target?.focus());
+    // The island viewport is still only 30px tall while the native resize is
+    // pending. Scrolling on focus now would leave the header above the panel.
+    const animationFrame = window.requestAnimationFrame(() =>
+      target?.focus({ preventScroll: isTauri }),
+    );
     return () => window.cancelAnimationFrame(animationFrame);
   }, []);
 
