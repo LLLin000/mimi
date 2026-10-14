@@ -4,6 +4,45 @@
 实测范围和未解决项；条目是历史证据，后续任务仍须核对当前源码与设备。
 不写密钥、音频、字幕正文或个人目录，不把临时日志当作已持久归档的案例。
 
+## 2026-10-15：v1.6.2 发布前独立回归
+
+- 产品源码：`acb4847a76733fb6b6cc3d0b9a898265e05abf4a`，基于
+  `844f0bde`；设计见 [选择框与显式凭据恢复](../plans/2026-10-15-release-recovery-regressions.md)。
+  本条记录发布前源码与原生检查，签名发布资产、CI 和公开下载另外核验。
+- 新发现的选择框解锁后重开、完整语音草稿因旧元数据读取失败而禁用保存，
+  都在 v1.6.1 已存在。正式组件与真实 voice consumer 先 4 项失败，再通过；
+  部分草稿继续要求可靠旧值，真实编辑页的保存拒绝保留字段及重试。最终
+  quick 覆盖 45 文件、1011 项，settings／overlay 共用控件及正常 keyboard／
+  search、名称 owner、迟到粘贴与 Android holder 的相邻路径复核未见新缺陷。
+- 待导入的自定义 speech 槽原先拦住完整显式替换。真实本地文件存储与 fake
+  legacy 的正式聚焦用例先 6 通过／3 失败，再 9 项全通过；file store 26 项、
+  多 route 文本槽保护 1 项通过。只放行 typed MigrationRequired 的完整有效
+  speech 值，未知旧值不删除回滚。写入大小失败保留原 pending 文档，marker
+  失败保留耐久新值供 retry；损坏／不可读文件和部分草稿不覆盖，文本多 route
+  blob、catalog／preferences 及正常 known-value rollback 保留原边界。
+- 精确 v1.6.1 tag `56f04d7d` 与本轮未改变的 shared source 独立对照：正常
+  aligner 10 案例／72 steps、subtitle 12 案例／74 steps、9 类 Qwen localhost
+  HTTP 响应一致，旧状态恢复通过；两版本取消／clear／reconnect 等聚焦各
+  7 项通过，公开 ASR WebSocket→queue→controller 的正常 final 和 stop-tail
+  成对结果一致。当前 incomplete／empty／withdrawal 等 12 项回归通过。
+- 完整 `./scripts/check.sh` 通过：前端 2195 项、桌面 Rust 608 项、shared
+  runtime 785 项；既有显式 native 环境的 ignored 项没有强制启用。两次独立
+  diff 复核没有发现阻塞。所有系统凭据及 I/O 故障仅使用 fake／临时目录。
+- Android Debug／Release 各 234 项 JVM 测试通过，包含生产 actual JNI；两种
+  lint 无错误，各有 63 项既有 warning。v1.6.2／10602 四 ABI debug APK 检查
+  通过，SHA256 `3a3c0a9aa3cc0c123df315312671e2eb3d930ab3843a71ea6a835dc9208dfd1f`。
+  Android 15 虚拟机按相同 signer `install -r` 保留开发数据，真实 Activity
+  recreate 再次通过：未保存合成名称、语音、workspace／mode、Qwen 和独立
+  MT 草稿保留、密码遮罩、不进 Bundle、取消不写 catalog、fresh editor 不串稿。
+- macOS canonical watch 及最终内嵌 `1.6.2-dev` 的 UI-only 签名开发版验证
+  添加确认、完整识别草稿保存、复制／返回、两可用配置 keyboard 切换及关闭
+  菜单；内嵌版本名称编辑立即离页再返回保留。运行路径为 canonical dev app，
+  构建／安装 UUID `B97A9C67-D056-34E1-82E0-B27E81E0235B` 一致；严格签名通过，
+  安装 executable SHA256 `410503de01efb1bc52d73d800a8d878d510fd47c343f6c1525e55ff00b887eb7`。
+  完成后正常退出，无服务连接或音频采集。
+- 限制：受控对照不是实际 provider 接受度／识别质量或实体 Android、Windows／
+  Linux 原生 UI 验收；未访问真实凭据或用户记录，未覆盖新的捕获硬件。
+
 ## 2026-10-15：第四轮 pending 状态与 Android 虚拟机复核
 
 - 产品源码：`4793d51454d009149371fdec3ff6c31b40426fd6`，基于
