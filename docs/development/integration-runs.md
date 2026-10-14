@@ -4,11 +4,11 @@
 实测范围和未解决项；条目是历史证据，后续任务仍须核对当前源码与设备。
 不写密钥、音频、字幕正文或个人目录，不把临时日志当作已持久归档的案例。
 
-## 2026-10-15：v1.6.2 发布前独立回归
+## 2026-10-15：v1.6.2 独立回归与公开交付
 
-- 产品源码：`acb4847a76733fb6b6cc3d0b9a898265e05abf4a`，基于
-  `844f0bde`；设计见 [选择框与显式凭据恢复](../plans/2026-10-15-release-recovery-regressions.md)。
-  本条记录发布前源码与原生检查，签名发布资产、CI 和公开下载另外核验。
+- 发布源码：`v1.6.2` → `17cbc0300b08f28a76c4396628d0d9ea33845584`；
+  本轮产品修复 `acb4847a` 基于 `844f0bde`，后续提交仅整理验证及公开文案。
+  设计见 [选择框与显式凭据恢复](../plans/2026-10-15-release-recovery-regressions.md)。
 - 新发现的选择框解锁后重开、完整语音草稿因旧元数据读取失败而禁用保存，
   都在 v1.6.1 已存在。正式组件与真实 voice consumer 先 4 项失败，再通过；
   部分草稿继续要求可靠旧值，真实编辑页的保存拒绝保留字段及重试。最终
@@ -40,8 +40,36 @@
   构建／安装 UUID `B97A9C67-D056-34E1-82E0-B27E81E0235B` 一致；严格签名通过，
   安装 executable SHA256 `410503de01efb1bc52d73d800a8d878d510fd47c343f6c1525e55ff00b887eb7`。
   完成后正常退出，无服务连接或音频采集。
-- 限制：受控对照不是实际 provider 接受度／识别质量或实体 Android、Windows／
-  Linux 原生 UI 验收；未访问真实凭据或用户记录，未覆盖新的捕获硬件。
+- 正式 macOS ARM64／Intel 两套 DMG 和 updater archive 均通过严格签名、
+  debugger 排除、version／architecture／sealed source 检查，DMG 内 app 与
+  loose app 的指定要求及 CDHash 一致。两种正式二进制分别实际启动并显示
+  v1.6.2；Intel 通过本机 Rosetta，均使用 UI-only，正式安装未替换。现有
+  正式 app 与新包的完整指定要求一致，没有迁移证书或更改系统权限。
+- main 桌面 `38607076333`／Android `38607076322`，tag 桌面
+  `38608784255`／Android `38608783870` 均成功。tag 流水线包括 Windows
+  x64／ARM64、便携解压及 Linux 成品 smoke、Linux synthetic PulseAudio
+  system／microphone、两种 macOS updater 和 Android 正式签名／rejection
+  检查；这些 CI 环境测试不等同于用户硬件和实际服务。
+- Android 正式 APK signer SHA256 为
+  `b263d1b5ec3c43eb4f8107f438a5cbebed18f9290e56ed2e0d0ffb11e4b74ec2`，
+  与实际下载的 v1.6.1 公开 APK 一致。四 ABI 检查通过，虚拟机安装并前台
+  启动正式 `MainActivity`，version 1.6.2／10602；installed code 与成品
+  SHA256 `0b33386e181f45988d1e6c94e5da54d6ccc08ce1d2ae5a7b5277b1e7d214550c`
+  一致。新正式包与已配置开发版使用独立 app scope，没有卸载或清理开发数据。
+- 四 macOS 资产先 staging 到私有 draft，再推精确 tag。所有 tag CI 完成后，
+  authenticated 草稿和无 Authorization 的公开下载各自核验 17 资产，远端
+  size／digest、16 项 SHA256SUMS 及 5 个实际 minisign 全部一致；updater
+  四平台 URL、signature、version 和 English-first／中文 notes 对应源码。
+  已按用户本次“检查没问题就发布”授权公开为 Latest：
+  [v1.6.2](https://github.com/yuxino/Mimi/releases/tag/v1.6.2)。tag-specific、
+  canonical Latest 及 app 实际配置的 updater endpoint 返回相同 manifest。
+- ego-lite 页面确认 Latest、immutable release、17cbc03、双语说明及 17
+  实际资产链接；页面另列两份源码和 release attestation，共显示 Assets 20。
+  本次新发代码的 authors 只有维护者，原生页面没有 Contributors 区域；没有
+  重复上一版的外部贡献者 credit 或为展示头像伪造新的感谢。
+- 限制：受控对照和 CI／虚拟机不能证明实际 provider 接受度／识别质量、
+  用户 Windows／Linux／Intel 或实体 Android 的捕获硬件。未连接实际服务、
+  开始音频捕获或访问真实用户凭据／记录。
 
 ## 2026-10-15：第四轮 pending 状态与 Android 虚拟机复核
 
