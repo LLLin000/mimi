@@ -1554,4 +1554,362 @@ mod tests {
         assert_eq!(fs::read_to_string(target).unwrap(), "public-foreign-value");
         assert_eq!(reads(&legacy), 0);
     }
+
+    fn pending_custom_settings(
+        provider: crate::core::provider::ProviderKind,
+    ) -> (
+        tempfile::TempDir,
+        FileCredentialStore,
+        super::super::ServiceProfile,
+        Legacy,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = Legacy::default();
+        let service = super::super::PROFILE_KEYCHAIN_SERVICE;
+        let bootstrap = SettingsStore::load_with_secret(
+            directory.path().into(),
+            false,
+            Box::new(legacy.clone()),
+            service,
+            false,
+        );
+        let profile = bootstrap
+            .create_profile(provider, "Synthetic import repair")
+            .unwrap();
+        drop(bootstrap);
+        let speech = credential_account(&profile);
+        let text = SettingsStore::destination_account(&profile);
+        {
+            let mut state = legacy.0.lock().unwrap();
+            state.denied.insert((service.into(), speech.clone()));
+            let destination = super::super::TextTranslationDestination {
+                endpoint: "https://example.com/translate".into(),
+                token: "synthetic retained text value".into(),
+                ..Default::default()
+            };
+            state.values.insert(
+                (service.into(), text.clone()),
+                serde_json::to_string(&destination).unwrap(),
+            );
+        }
+        let local = FileCredentialStore::new(
+            directory.path(),
+            service,
+            vec![
+                Slot {
+                    service: service.into(),
+                    account: speech,
+                    legacy_alibaba: false,
+                },
+                Slot {
+                    service: service.into(),
+                    account: text,
+                    legacy_alibaba: false,
+                },
+            ],
+            Box::new(legacy.clone()),
+        );
+        assert_eq!(local.migrate_legacy(), Err(SecretStoreError::Unavailable));
+        assert_eq!(local.pending_imports().unwrap(), 1);
+        (directory, local, profile, legacy)
+    }
+
+    fn complete_speech_request(key: &str) -> crate::core::credentials::ProviderCredentials {
+        crate::core::credentials::ProviderCredentials::CustomSpeech {
+            endpoint: "wss://speech.example/realtime".into(),
+            model: "synthetic-model".into(),
+            api_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn complete_custom_speech_replacement_retires_only_its_pending_import() {
+        use crate::core::{credentials::ProviderCredentials, provider::ProviderKind};
+        for provider in [
+            ProviderKind::CustomOpenAIASR,
+            ProviderKind::CustomDashScopeASR,
+        ] {
+            let (directory, local, profile, legacy) = pending_custom_settings(provider);
+            let path = local.path.clone();
+            let original = fs::read(&path).unwrap();
+            let native_reads = reads(&legacy);
+            let mut store = SettingsStore::load_with_secret(
+                directory.path().into(),
+                false,
+                Box::new(local),
+                super::super::PROFILE_KEYCHAIN_SERVICE,
+                false,
+            );
+            let metadata = store.profile_catalog().unwrap();
+            for request in [
+                ProviderCredentials::CustomSpeech {
+                    endpoint: String::new(),
+                    model: "synthetic-model".into(),
+                    api_key: "synthetic-new-key".into(),
+                },
+                ProviderCredentials::CustomSpeech {
+                    endpoint: "wss://speech.example/realtime".into(),
+                    model: String::new(),
+                    api_key: "synthetic-new-key".into(),
+                },
+                ProviderCredentials::CustomSpeech {
+                    endpoint: "wss://speech.example/realtime".into(),
+                    model: "synthetic-model".into(),
+                    api_key: String::new(),
+                },
+            ] {
+                assert!(store.save_credentials(&profile.id, &request).is_err());
+                assert_eq!(fs::read(&path).unwrap(), original);
+            }
+            let blocked = directory.path().join("blocked-metadata-output");
+            fs::create_dir(&blocked).unwrap();
+            store.catalog_path = blocked.clone();
+            store.prefs_path = blocked;
+            store
+                .save_credentials(&profile.id, &complete_speech_request("synthetic-new-key"))
+                .unwrap();
+            assert_eq!(store.profile_catalog().unwrap(), metadata);
+            let text = store.destination_value(&profile).unwrap().unwrap();
+            let text: super::super::TextTranslationDestination =
+                serde_json::from_str(&text).unwrap();
+            assert_eq!(text.token, "synthetic retained text value");
+            assert!(directory
+                .path()
+                .join("credentials-file-mode-complete")
+                .is_file());
+            assert_eq!(reads(&legacy), native_reads);
+            drop(store);
+            let restarted = FileCredentialStore::new(
+                directory.path(),
+                super::super::PROFILE_KEYCHAIN_SERVICE,
+                Vec::new(),
+                Box::new(legacy.clone()),
+            );
+            let store = SettingsStore::load_with_secret(
+                directory.path().into(),
+                false,
+                Box::new(restarted),
+                super::super::PROFILE_KEYCHAIN_SERVICE,
+                false,
+            );
+            assert!(
+                matches!(store.credentials_for_profile(&profile).unwrap(), Some(ProviderCredentials::CustomSpeech { api_key, .. }) if api_key == "synthetic-new-key")
+            );
+            assert_eq!(reads(&legacy), native_reads);
+        }
+    }
+
+    #[test]
+    fn pending_custom_speech_marker_failure_keeps_the_durable_replacement_for_retry() {
+        let (directory, mut local, profile, legacy) =
+            pending_custom_settings(crate::core::provider::ProviderKind::CustomOpenAIASR);
+        let path = local.path.clone();
+        let blocker = directory.path().join("blocked-marker-parent");
+        fs::write(&blocker, b"synthetic obstruction").unwrap();
+        local.complete_path = blocker.join("complete");
+        let native_reads = reads(&legacy);
+        let store = SettingsStore::load_with_secret(
+            directory.path().into(),
+            false,
+            Box::new(local),
+            super::super::PROFILE_KEYCHAIN_SERVICE,
+            false,
+        );
+        assert!(store
+            .save_credentials(&profile.id, &complete_speech_request("synthetic-new-key"))
+            .is_err());
+        let document: Document = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(document.entries[super::super::PROFILE_KEYCHAIN_SERVICE]
+            .get(&credential_account(&profile))
+            .is_some_and(Option::is_some));
+        assert!(document.pending_import.is_empty());
+        assert_eq!(reads(&legacy), native_reads);
+        fs::remove_file(&blocker).unwrap();
+        fs::create_dir(&blocker).unwrap();
+        store
+            .save_credentials(&profile.id, &complete_speech_request("synthetic-new-key"))
+            .unwrap();
+        assert!(blocker.join("complete").is_file());
+        assert_eq!(reads(&legacy), native_reads);
+    }
+
+    #[test]
+    fn pending_custom_speech_failed_local_write_preserves_the_pending_document() {
+        let (directory, local, profile, legacy) =
+            pending_custom_settings(crate::core::provider::ProviderKind::CustomOpenAIASR);
+        let path = local.path.clone();
+        let mut document: Document = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        document
+            .entries
+            .entry("synthetic unrelated service".into())
+            .or_default()
+            .insert(
+                "padding".into(),
+                Some("x".repeat(MAX_BYTES as usize - 3000)),
+            );
+        let original = serde_json::to_vec(&document).unwrap();
+        assert!((original.len() as u64) < MAX_BYTES);
+        fs::write(&path, &original).unwrap();
+        let native_reads = reads(&legacy);
+        let store = SettingsStore::load_with_secret(
+            directory.path().into(),
+            false,
+            Box::new(local),
+            super::super::PROFILE_KEYCHAIN_SERVICE,
+            false,
+        );
+        assert!(store
+            .save_credentials(&profile.id, &complete_speech_request(&"k".repeat(8192)))
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!directory
+            .path()
+            .join("credentials-file-mode-complete")
+            .exists());
+        document.entries.remove("synthetic unrelated service");
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        store
+            .save_credentials(&profile.id, &complete_speech_request("synthetic-new-key"))
+            .unwrap();
+        assert!(directory
+            .path()
+            .join("credentials-file-mode-complete")
+            .is_file());
+        assert_eq!(reads(&legacy), native_reads);
+    }
+
+    #[test]
+    fn complete_custom_speech_replacement_cannot_overwrite_a_damaged_document() {
+        let (directory, local, profile, legacy) =
+            pending_custom_settings(crate::core::provider::ProviderKind::CustomOpenAIASR);
+        let path = local.path.clone();
+        let native_reads = reads(&legacy);
+        let store = SettingsStore::load_with_secret(
+            directory.path().into(),
+            false,
+            Box::new(local),
+            super::super::PROFILE_KEYCHAIN_SERVICE,
+            false,
+        );
+        fs::write(&path, b"synthetic damaged document").unwrap();
+        assert!(store
+            .save_credentials(&profile.id, &complete_speech_request("synthetic-new-key"))
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic damaged document");
+        assert_eq!(reads(&legacy), native_reads);
+        assert!(!directory
+            .path()
+            .join("credentials-file-mode-complete")
+            .exists());
+    }
+
+    #[test]
+    fn complete_text_route_cannot_replace_an_unread_multi_route_import() {
+        use crate::core::{
+            credentials::ProviderCredentials,
+            provider::{ProviderKind, TextTranslation},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = Legacy::default();
+        let service = super::super::PROFILE_KEYCHAIN_SERVICE;
+        let bootstrap = SettingsStore::load_with_secret(
+            directory.path().into(),
+            false,
+            Box::new(legacy.clone()),
+            service,
+            false,
+        );
+        let profile = bootstrap
+            .create_profile(ProviderKind::CustomOpenAIASR, "Synthetic text import")
+            .unwrap();
+        drop(bootstrap);
+        let speech = credential_account(&profile);
+        let text = SettingsStore::destination_account(&profile);
+        let speech_value = complete_speech_request("synthetic-old-speech")
+            .encode_for_keychain(profile.provider)
+            .unwrap();
+        let destination = super::super::TextTranslationDestination {
+            endpoint: "https://old.example/translate".into(),
+            token: "synthetic-old-deeplx".into(),
+            open_ai_compatible: Some(super::super::OpenAICompatibleDestination {
+                endpoint: "https://old.example/v1".into(),
+                api_key: "synthetic-old-openai".into(),
+                model: "synthetic-old-model".into(),
+            }),
+            chat_mock: Some(super::super::OpenAICompatibleDestination {
+                endpoint: "http://localhost:8000/v1".into(),
+                api_key: "synthetic-old-chatmock".into(),
+                model: "synthetic-other-model".into(),
+            }),
+            ..Default::default()
+        };
+        let destination_value = serde_json::to_string(&destination).unwrap();
+        {
+            let mut state = legacy.0.lock().unwrap();
+            state
+                .values
+                .insert((service.into(), speech.clone()), speech_value.clone());
+            state
+                .values
+                .insert((service.into(), text.clone()), destination_value.clone());
+            state.denied.insert((service.into(), text.clone()));
+        }
+        let local = FileCredentialStore::new(
+            directory.path(),
+            service,
+            vec![
+                Slot {
+                    service: service.into(),
+                    account: speech.clone(),
+                    legacy_alibaba: false,
+                },
+                Slot {
+                    service: service.into(),
+                    account: text.clone(),
+                    legacy_alibaba: false,
+                },
+            ],
+            Box::new(legacy.clone()),
+        );
+        assert_eq!(local.migrate_legacy(), Err(SecretStoreError::Unavailable));
+        assert_eq!(local.pending_imports().unwrap(), 1);
+        let path = local.path.clone();
+        let original = fs::read(&path).unwrap();
+        let native_reads = reads(&legacy);
+        let store = SettingsStore::load_with_secret(
+            directory.path().into(),
+            false,
+            Box::new(local),
+            service,
+            false,
+        );
+        let metadata = store.profile_catalog().unwrap();
+        let request = ProviderCredentials::AlibabaTranslation {
+            api_key: String::new(),
+            text_translation: TextTranslation::OpenAICompatible,
+            endpoint: "https://replacement.example/v1".into(),
+            token: "synthetic-new-openai".into(),
+            model: "synthetic-new-model".into(),
+            clear_token: false,
+        };
+        assert_eq!(
+            store.save_credentials(&profile.id, &request),
+            Err(SecretStoreError::MigrationRequired.public_error())
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(store.profile_catalog().unwrap(), metadata);
+        assert_eq!(
+            store.load_api_key_for_profile(&profile).unwrap(),
+            Some(speech_value)
+        );
+        assert_eq!(reads(&legacy), native_reads);
+        assert_eq!(
+            legacy.0.lock().unwrap().values.get(&(service.into(), text)),
+            Some(&destination_value)
+        );
+        assert!(!directory
+            .path()
+            .join("credentials-file-mode-complete")
+            .exists());
+    }
 }

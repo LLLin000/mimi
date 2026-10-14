@@ -83,6 +83,9 @@ export function Select({ label, value, options, disabled = false, searchLabel, e
   const active = resolveCursor(cursor);
   const open = popup !== null && !disabled;
 
+  // A native connection/busy transition closes the current interaction. Keep
+  // it closed after unlocking until the user explicitly opens the picker.
+  if (disabled && popup !== null) setPopup(null);
   useEffect(() => { lastChoice.current = value; }, [value]);
 
   function setActive(index: number | ((previous: number) => number), reveal = true) {

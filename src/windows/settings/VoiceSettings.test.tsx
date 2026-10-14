@@ -22,6 +22,7 @@ let host: HTMLDivElement;
 let root: Root;
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  state.session.status.kind = "idle";
   state.selectProfile.mockClear();
   state.settings = { ...state.settings, activeProfileId: "ready", targetLanguage: "zh", profiles: [
     { id: "ready", name: "Ready service", provider: "alibabaCloud", credentialState: "present", alibabaRealtimeMode: "disabled" },
@@ -69,4 +70,17 @@ it("allows a saved configuration after its missing credentials become available"
   await render();
   await act(async () => option("Missing credentials").click());
   expect(state.selectProfile).toHaveBeenCalledExactlyOnceWith("missing");
+});
+
+it("does not revive the profile picker after native connecting and active state changes", async () => {
+  state.session.status.kind = "connecting";
+  await render();
+  expect(document.querySelector('[role="listbox"]')).toBeNull();
+  state.session.status.kind = "active";
+  await render();
+  expect(document.querySelector('[role="listbox"]')).toBeNull();
+  expect(state.selectProfile).not.toHaveBeenCalled();
+  await act(() => host.querySelector<HTMLButtonElement>('[role="combobox"]')!.click());
+  await act(async () => option("Another ready service").click());
+  expect(state.selectProfile).toHaveBeenCalledExactlyOnceWith("another");
 });

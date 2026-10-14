@@ -90,6 +90,28 @@ it("keeps disabled options visible while blocking pointer hover and selection", 
   expect(onChange).toHaveBeenCalledExactlyOnceWith("beta");
 });
 
+it.each([false, true])("closes a disabled picker without reviving its old popup or query when enabled again (search=%s)", async searchable => {
+  const show = async (disabled: boolean) => act(() => root.render(<Select label="Choice" value="translation" options={options}
+    disabled={disabled} searchLabel={searchable ? "Filter" : undefined} onChange={onChange} />));
+  await show(false);
+  await act(() => trigger().click());
+  if (searchable) await act(() => {
+    const input = document.querySelector<HTMLInputElement>(".mimi-select__search")!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "双语");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await show(true);
+  expect(trigger().disabled).toBe(true);
+  expect(document.querySelector(".mimi-select__menu")).toBeNull();
+  await show(false);
+  expect(document.querySelector(".mimi-select__menu")).toBeNull();
+  expect(trigger().getAttribute("aria-expanded")).toBe("false");
+  expect(onChange).not.toHaveBeenCalled();
+  await act(() => trigger().click());
+  expect(document.querySelectorAll('[role="option"]')).toHaveLength(3);
+  if (searchable) expect(document.querySelector<HTMLInputElement>(".mimi-select__search")!.value).toBe("");
+});
+
 it.each(["Enter", " "])("skips disabled choices with arrows and boundaries before confirming with %j", async confirm => {
   await act(() => root.render(<Select label="Choice" value="alpha" options={partlyUnavailable} onChange={onChange} />));
   await act(() => trigger().click());

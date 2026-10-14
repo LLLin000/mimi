@@ -37,13 +37,13 @@ export function CustomSpeechCredentialEditor(props: ComponentProps<typeof Alibab
     endpoint: changedEndpoint || !saved ? endpoint : "",
     model: changedModel || changedEndpoint || !saved ? model : "",
   };
-  const credentials = saved && (editorState.loading || editorState.error) ? null : buildCustomSpeechCredentials(profile, speechDraft);
+  // A complete explicit replacement owns every speech field and may attempt a
+  // save without old metadata. Partial drafts still require that saved read.
+  const completeSpeechDraft = buildCustomSpeechCredentials({ ...profile, speechCredentialState: "missing" }, draft);
+  const credentials = saved && (editorState.loading || editorState.error) ? completeSpeechDraft : buildCustomSpeechCredentials(profile, speechDraft);
   const speechChanged = !!changedEndpoint || !!changedModel || !!draft.apiKey.trim();
   const retrySavedSpeech = (profile.speechCredentialState ?? profile.credentialState) === "unavailable" && !changedFields.endpoint && !changedFields.model && !draft.apiKey;
   const invalidSpeechDraft = ((changedFields.endpoint || !saved) && !customSpeechEndpointIsValid(endpoint)) || ((changedFields.model || !saved) && !openAICompatibleModelIsValid(model));
-  // An explicit complete replacement can be checked even if the saved-value
-  // read failed. Partial drafts still need the saved configuration to resolve.
-  const completeSpeechDraft = buildCustomSpeechCredentials({ ...profile, speechCredentialState: "missing" }, draft);
   const speechCheckDraft: ProviderCredentialsInput | null | undefined = retrySavedSpeech || (saved && !speechChanged)
     ? undefined : invalidSpeechDraft ? null : credentials ?? completeSpeechDraft;
   const endpointRef = useRef<ConfigInputElement>(null);

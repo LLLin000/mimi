@@ -1498,6 +1498,34 @@ it.each([
   expect(profileRevealCredential).not.toHaveBeenCalled();
 });
 
+it.each(["unavailable", "present"] as const)("saves an explicit complete custom speech replacement after a metadata read failure (%s)", async state => {
+  const custom: ServiceProfile = { ...profile, provider: "customOpenAIASR", credentialState: state, speechCredentialState: state,
+    textTranslation: "followService", textCredentialState: "missing" };
+  const snapshot = { ...settings, profiles: [custom] };
+  vi.mocked(profileCredentialEditorState).mockRejectedValue("credential_store_unavailable");
+  actions.saveProfileCredentials.mockRejectedValueOnce("credential_store_unavailable");
+  actions.selectProfile.mockResolvedValue(snapshot);
+  await render(snapshot);
+  await change('input[id$="-speech-endpoint"]', "wss://replacement.example/inference");
+  await change('input[id$="-speech-model"]', "replacement-model");
+  await change('input[id$="-speech-key"]', "synthetic-replacement-key");
+  const button = [...host.querySelectorAll<HTMLButtonElement>("button")].find(node => node.textContent === I18N.settings.saveSpeechConfiguration)!;
+  expect(button.disabled).toBe(false);
+  await act(async () => button.click());
+  const credentials = { kind: "customSpeech", endpoint: "wss://replacement.example/inference", model: "replacement-model", apiKey: "synthetic-replacement-key" };
+  expect(actions.saveProfileCredentials).toHaveBeenCalledExactlyOnceWith(profile.id, credentials);
+  expect(host.querySelector<HTMLInputElement>('input[id$="-speech-key"]')!.value).toBe("synthetic-replacement-key");
+  expect(host.querySelector<HTMLInputElement>('input[id$="-speech-endpoint"]')!.value).toBe("wss://replacement.example/inference");
+  expect(host.querySelector<HTMLInputElement>('input[id$="-speech-model"]')!.value).toBe("replacement-model");
+  expect(host.textContent).toContain(profileErrorMessage("credential_store_unavailable"));
+  expect(actions.selectProfile).not.toHaveBeenCalled();
+  actions.saveProfileCredentials.mockResolvedValueOnce(snapshot);
+  await act(async () => button.click());
+  expect(actions.saveProfileCredentials).toHaveBeenCalledTimes(2);
+  expect(actions.saveProfileCredentials).toHaveBeenLastCalledWith(profile.id, credentials);
+  expect(profileRevealCredential).not.toHaveBeenCalled();
+});
+
 it("shows independent translation names in the profile list and route picker without changing protocol icons", async () => {
   const named: ServiceProfile = { ...profile, credentialState: "present", textTranslation: "openAICompatible",
     textTranslationNames: { openAICompatible: "Office translator", deepLX: "Local translator" } };

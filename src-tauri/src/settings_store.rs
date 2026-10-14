@@ -2254,9 +2254,28 @@ impl SettingsStore {
             )
         };
         self.retry_profile_credential_errors(profile, true, false);
-        let previous = self
-            .load_api_key_for_profile(profile)
-            .map_err(SecretStoreError::public_error)?;
+        let previous = match self.load_api_key_for_profile(profile) {
+            Ok(previous) => previous,
+            Err(SecretStoreError::MigrationRequired) => {
+                // A complete explicit value can retire its unread pending import.
+                // The unknown old value must never become a missing-key rollback.
+                let (Some(endpoint), Some(model)) = (&entered_endpoint, &entered_model) else {
+                    return Err(SecretStoreError::MigrationRequired.public_error());
+                };
+                if api_key.trim().is_empty() {
+                    return Err(SecretStoreError::MigrationRequired.public_error());
+                }
+                let value = ProviderCredentials::CustomSpeech {
+                    endpoint: endpoint.clone(),
+                    model: model.clone(),
+                    api_key: api_key.into(),
+                }
+                .encode_for_keychain(profile.provider)
+                .map_err(|error| error.to_string())?;
+                return self.save_api_key_for_profile(profile, &value, true);
+            }
+            Err(error) => return Err(error.public_error()),
+        };
         let previous_credentials = previous
             .as_deref()
             .map(|value| ProviderCredentials::decode_for_profile(profile, value))
