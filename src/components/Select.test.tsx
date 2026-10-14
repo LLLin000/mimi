@@ -45,6 +45,17 @@ const translatorOptions = [
   { value: "deepLX", label: "DeepLX" },
 ];
 
+const partlyUnavailable = [
+  { value: "first", label: "Unavailable first", disabled: true },
+  { value: "alpha", label: "Alpha" },
+  { value: "blocked", label: "Blocked", disabled: true },
+  { value: "beta", label: "Beta" },
+  { value: "last", label: "Unavailable last", disabled: true },
+];
+async function choiceKey(key: string) {
+  await act(() => trigger().dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })));
+}
+
 it("keeps decorative option icons beside unchanged labels and preserves keyboard typeahead", async () => {
   await act(() => root.render(<Select label="文字翻译" value="default" options={translatorOptions} onChange={onChange} />));
   expect(trigger().textContent).toBe("Alibaba");
@@ -59,6 +70,100 @@ it("keeps decorative option icons beside unchanged labels and preserves keyboard
   await act(() => root.render(<Select label="文字翻译" value="deepL" options={translatorOptions} onChange={onChange} />));
   expect(trigger().textContent).toBe("DeepL");
   expect(trigger().querySelector('.mimi-select__icon[aria-hidden="true"] img')).not.toBeNull();
+});
+
+it("keeps disabled options visible while blocking pointer hover and selection", async () => {
+  await act(() => root.render(<Select label="Choice" value="alpha" options={partlyUnavailable} onChange={onChange} />));
+  await act(() => trigger().click());
+  expect(document.querySelectorAll('[role="option"]')).toHaveLength(5);
+  const blocked = document.querySelectorAll<HTMLElement>('[role="option"]')[2];
+  expect(blocked.getAttribute("aria-disabled")).toBe("true");
+  await act(() => blocked.dispatchEvent(new Event("pointermove", { bubbles: true })));
+  expect(document.querySelector('[data-active="true"]')?.textContent).toBe("Alpha");
+  await act(() => blocked.click());
+  expect(onChange).not.toHaveBeenCalled();
+  expect(trigger().getAttribute("aria-expanded")).toBe("true");
+  const usable = document.querySelectorAll<HTMLElement>('[role="option"]')[3];
+  await act(() => usable.dispatchEvent(new Event("pointermove", { bubbles: true })));
+  expect(document.querySelector('[data-active="true"]')?.textContent).toBe("Beta");
+  await act(() => usable.click());
+  expect(onChange).toHaveBeenCalledExactlyOnceWith("beta");
+});
+
+it.each(["Enter", " "])("skips disabled choices with arrows and boundaries before confirming with %j", async confirm => {
+  await act(() => root.render(<Select label="Choice" value="alpha" options={partlyUnavailable} onChange={onChange} />));
+  await act(() => trigger().click());
+  for (const [key, label] of [["ArrowDown", "Beta"], ["ArrowDown", "Alpha"], ["ArrowUp", "Beta"], ["Home", "Alpha"], ["End", "Beta"]]) {
+    await choiceKey(key);
+    expect(document.querySelector('[data-active="true"]')?.textContent).toBe(label);
+  }
+  expect(onChange).not.toHaveBeenCalled();
+  await choiceKey(confirm);
+  expect(onChange).toHaveBeenCalledExactlyOnceWith("beta");
+});
+
+it("ignores disabled typeahead matches while retaining normal confirmation", async () => {
+  await act(() => root.render(<Select label="Choice" value="alpha" options={partlyUnavailable} onChange={onChange} />));
+  await choiceKey("B");
+  expect(document.querySelector('[data-active="true"]')?.textContent).toBe("Beta");
+  await choiceKey("Enter");
+  expect(onChange).toHaveBeenCalledExactlyOnceWith("beta");
+});
+
+it("skips unavailable rows for rapid closed arrows and a disabled current value", async () => {
+  const renderChoice = (value: string) => act(() => root.render(<Select label="Choice" value={value} options={partlyUnavailable} closedArrowSelection onChange={onChange} />));
+  await renderChoice("alpha");
+  await act(() => {
+    for (const key of ["ArrowDown", "ArrowDown", "ArrowUp"]) trigger().dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+  });
+  expect(onChange.mock.calls).toEqual([["beta"], ["alpha"], ["beta"]]);
+  onChange.mockClear();
+  await renderChoice("blocked"); await choiceKey("ArrowDown");
+  await renderChoice("blocked"); await choiceKey("ArrowUp");
+  expect(onChange.mock.calls).toEqual([["beta"], ["alpha"]]);
+  expect(document.querySelector('[role="listbox"]')).toBeNull();
+});
+
+it("keeps search results visible without an active choice when every match is disabled", async () => {
+  await act(() => root.render(<Select label="Choice" value="alpha" options={partlyUnavailable} searchLabel="Search" onChange={onChange} />));
+  await act(() => trigger().click());
+  await typeQuery("Blocked");
+  expect(visibleLabels()).toEqual(["Blocked"]);
+  for (const keyName of ["ArrowDown", "ArrowUp", "Home", "End", "Enter"]) await key(keyName);
+  expect(document.querySelector('[data-active="true"]')).toBeNull();
+  expect(input().getAttribute("aria-activedescendant")).toBeNull();
+  expect(onChange).not.toHaveBeenCalled();
+  expect(trigger().getAttribute("aria-expanded")).toBe("true");
+  await typeQuery("Beta"); await key("Enter");
+  expect(onChange).toHaveBeenCalledExactlyOnceWith("beta");
+});
+
+it("moves an active disabled row to the next enabled choice without changing the saved value", async () => {
+  const renderChoices = (choices: typeof partlyUnavailable) => act(() => root.render(<Select label="Choice" value="alpha" options={choices} onChange={onChange} />));
+  await renderChoices(partlyUnavailable); await act(() => trigger().click());
+  await choiceKey("ArrowDown");
+  await renderChoices(partlyUnavailable.map(option => option.value === "beta" ? { ...option, disabled: true } : option));
+  expect(document.querySelector('[data-active="true"]')?.textContent).toBe("Alpha");
+  await renderChoices(partlyUnavailable.map(option => ({ ...option, disabled: true })));
+  expect(trigger().textContent).toBe("Alpha");
+  expect(document.querySelector('[aria-selected="true"]')?.getAttribute("aria-disabled")).toBe("true");
+  expect(document.querySelector('[data-active="true"]')).toBeNull();
+  await choiceKey("Enter"); expect(onChange).not.toHaveBeenCalled();
+  await renderChoices(partlyUnavailable.map(option => ({ ...option, disabled: option.value !== "beta" })));
+  expect(document.querySelector('[data-active="true"]')?.textContent).toBe("Beta");
+  await choiceKey("Enter"); expect(onChange).toHaveBeenCalledExactlyOnceWith("beta");
+});
+
+it("leaves all-disabled closed choices unchanged and allows opening their visible list", async () => {
+  await act(() => root.render(<Select label="Choice" value="alpha" options={partlyUnavailable.map(option => ({ ...option, disabled: true }))} closedArrowSelection onChange={onChange} />));
+  await choiceKey("ArrowDown"); await choiceKey("ArrowUp");
+  expect(onChange).not.toHaveBeenCalled();
+  await choiceKey("Enter");
+  expect(document.querySelectorAll('[role="option"]')).toHaveLength(5);
+  for (const key of ["ArrowDown", "ArrowUp", "Home", "End", "Enter", " "]) await choiceKey(key);
+  expect(document.querySelector('[data-active="true"]')).toBeNull();
+  expect(onChange).not.toHaveBeenCalled();
+  expect(trigger().getAttribute("aria-expanded")).toBe("true");
 });
 
 it("uses a fallback icon only while the saved selection is absent from the options", async () => {

@@ -13,6 +13,8 @@ type MenuStyle = CSSProperties & {
 export interface SelectOption {
   value: string;
   label: string;
+  /** Keep unavailable choices visible without allowing them to be selected. */
+  disabled?: boolean;
   /** Optional second line in the menu; the closed control keeps the name compact. */
   description?: string;
   /** Decorative mark; the label remains the option's searchable name. */
@@ -40,6 +42,14 @@ interface SelectProps {
   onChange: (value: string) => void;
 }
 
+function nextEnabledOption(options: readonly SelectOption[], start: number, direction: 1 | -1): number {
+  for (let offset = 1; offset <= options.length; offset += 1) {
+    const index = (start + direction * offset + options.length) % options.length;
+    if (!options[index].disabled) return index;
+  }
+  return -1;
+}
+
 /** One app-styled picker for Settings, the subtitle controls, and the tray. */
 export function Select({ label, value, options, disabled = false, searchLabel, emptyMessage, loadingMessage, valueLabel, valueIcon, onOpen, closedArrowSelection = false, onChange }: SelectProps) {
   const id = useId();
@@ -63,9 +73,14 @@ export function Select({ label, value, options, disabled = false, searchLabel, e
   const selectedIcon = selected >= 0 ? options[selected].icon : valueIcon;
   const selectedVisible = visible.findIndex(option => option.value === value);
   const [cursor, setCursor] = useState({ selection: value, query: "", index: 0 });
-  // A shortcut/another window can change the value while the menu is open.
-  const active = visible.length === 0 ? -1 : Math.min(visible.length - 1,
-    cursor.selection === value && cursor.query === query && cursor.index >= 0 ? cursor.index : Math.max(0, selectedVisible));
+  // Keep the selected value even if it becomes unavailable, but only enabled
+  // rows can own the cursor. A disabled cursor advances to the next usable row.
+  const resolveCursor = (position: typeof cursor) => {
+    const preferred = position.selection === value && position.query === query && position.index >= 0
+      ? position.index : Math.max(0, selectedVisible);
+    return nextEnabledOption(visible, Math.min(visible.length - 1, preferred) - 1, 1);
+  };
+  const active = resolveCursor(cursor);
   const open = popup !== null && !disabled;
 
   useEffect(() => { lastChoice.current = value; }, [value]);
@@ -75,7 +90,7 @@ export function Select({ label, value, options, disabled = false, searchLabel, e
     setCursor(previous => ({
       selection: value,
       query,
-      index: typeof index === "number" ? index : index(previous.selection === value && previous.query === query && previous.index >= 0 ? previous.index : Math.max(0, selectedVisible)),
+      index: typeof index === "number" ? index : index(resolveCursor(previous)),
     }));
   }
 
@@ -125,6 +140,7 @@ export function Select({ label, value, options, disabled = false, searchLabel, e
 
   function choose(index: number) {
     const option = visible[index];
+    if (!option || option.disabled) return;
     setPopup(null);
     trigger.current?.focus();
     if (option && option.value !== value) {
@@ -198,8 +214,9 @@ export function Select({ label, value, options, disabled = false, searchLabel, e
         // latest choice synchronously so repeated keys can precede a render.
         if (options.length === 0) return;
         const previous = options.findIndex(option => option.value === lastChoice.current);
-        const index = previous < 0 ? event.key === "ArrowDown" ? 0 : options.length - 1
-          : (previous + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const index = nextEnabledOption(options, previous < 0 && direction === -1 ? 0 : previous, direction);
+        if (index < 0) return;
         const next = options[index].value;
         if (next !== lastChoice.current) {
           lastChoice.current = next;
@@ -210,9 +227,12 @@ export function Select({ label, value, options, disabled = false, searchLabel, e
       if (!open) { show(); return; }
       if (visible.length === 0) return;
       if (event.key === "Enter" || event.key === " ") choose(active);
-      else if (event.key === "Home") setActive(0);
-      else if (event.key === "End") setActive(visible.length - 1);
-      else setActive((index) => (index + (event.key === "ArrowDown" ? 1 : -1) + visible.length) % visible.length);
+      else if (event.key === "Home") setActive(nextEnabledOption(visible, -1, 1));
+      else if (event.key === "End") setActive(nextEnabledOption(visible, 0, -1));
+      else setActive((index) => {
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        return nextEnabledOption(visible, index < 0 && direction === -1 ? 0 : index, direction);
+      });
       return;
     }
     if (event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey) {
@@ -227,7 +247,7 @@ export function Select({ label, value, options, disabled = false, searchLabel, e
       const now = event.timeStamp;
       const text = (now - typeahead.current.at < 700 ? typeahead.current.text : "") + event.key.toLocaleLowerCase();
       typeahead.current = { text, at: now };
-      const index = options.findIndex((option) => option.label.toLocaleLowerCase().startsWith(text));
+      const index = options.findIndex((option) => !option.disabled && option.label.toLocaleLowerCase().startsWith(text));
       if (index >= 0) setActive(index);
     }
   }
@@ -244,8 +264,8 @@ export function Select({ label, value, options, disabled = false, searchLabel, e
       if (node) optionNodes.current.set(option.value, node);
       else optionNodes.current.delete(option.value);
     }} className="mimi-select__option" role="option"
-      aria-selected={option.value === value} data-active={index === active}
-      onPointerMove={() => setActive(index, false)} onPointerDown={(event) => event.preventDefault()}
+      aria-selected={option.value === value} aria-disabled={option.disabled || undefined} data-active={index === active}
+      onPointerMove={() => { if (!option.disabled) setActive(index, false); }} onPointerDown={(event) => event.preventDefault()}
       onClick={() => choose(index)}>
       <span className="mimi-select__content">
         {option.icon && <span className="mimi-select__icon" aria-hidden="true">{option.icon}</span>}
