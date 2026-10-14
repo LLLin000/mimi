@@ -16071,5 +16071,53 @@
         "wire": "uk"
       }
     ]
-  }
+  },
+  "customRecognitionCompletions": [
+    {
+      "id": "empty-completion-retires-preview",
+      "draft": "Synthetic withdrawn preview.",
+      "completion": "",
+      "expected": {
+        "finalTexts": [
+          ""
+        ],
+        "confirmedSources": []
+      }
+    },
+    {
+      "id": "whitespace-completion-retires-preview",
+      "draft": "Synthetic withdrawn preview.",
+      "completion": " \t ",
+      "expected": {
+        "finalTexts": [
+          " \t "
+        ],
+        "confirmedSources": []
+      }
+    },
+    {
+      "id": "nonempty-completion-replaces-preview",
+      "draft": "Synthetic withdrawn preview.",
+      "completion": "Synthetic accepted final.",
+      "expected": {
+        "finalTexts": [
+          "Synthetic accepted final."
+        ],
+        "confirmedSources": [
+          "Synthetic accepted final."
+        ]
+      }
+    },
+    {
+      "id": "missing-completion-keeps-stop-tail",
+      "draft": "Synthetic withdrawn preview.",
+      "completion": null,
+      "expected": {
+        "finalTexts": [],
+        "confirmedSources": [
+          "Synthetic withdrawn preview."
+        ]
+      }
+    }
+  ]
 }

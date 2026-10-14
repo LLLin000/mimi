@@ -591,6 +591,23 @@ impl ProviderEventReceiver {
 
     fn take_reliable_event(&mut self, event: SequencedEvent) -> ProviderEvent {
         match &event.event {
+            LiveTranslateServerEvent::SubtitlePreviewWithdrawn {
+                source_utterance_id,
+            } => {
+                // Reliable controls are read before latest-value drafts. Consume
+                // the matching earlier slot now; a later withdrawal must never
+                // replace a marker and make this withdrawn draft visible again.
+                refresh_pending(
+                    &mut self.source_draft,
+                    &mut self.source_open,
+                    &mut self.source_pending,
+                );
+                drop(self.source_pending.take_if(|draft| {
+                    draft.content_revision == event.content_revision
+                        && draft.sequence <= event.sequence
+                        && matches!(draft.event, LiveTranslateServerEvent::SourceUtteranceDraft { utterance_id, .. } if utterance_id == *source_utterance_id)
+                }));
+            }
             LiveTranslateServerEvent::SubtitleIdentifiedFinalPair { utterance_id, .. } => {
                 self.last_identified_final =
                     Some((event.sequence, event.content_revision, utterance_id.clone()));
@@ -614,6 +631,7 @@ impl ProviderEventReceiver {
                 | LiveTranslateServerEvent::PreviewTranslationFinished { .. }
                 | LiveTranslateServerEvent::SubtitlePreviewPair { .. }
                 | LiveTranslateServerEvent::SubtitlePreviewCleared
+                | LiveTranslateServerEvent::SubtitlePreviewWithdrawn { .. }
                 | LiveTranslateServerEvent::TranslationStarted
                 | LiveTranslateServerEvent::TranslationDeferred(_)
                 | LiveTranslateServerEvent::UtteranceRegistered { .. }
@@ -717,6 +735,65 @@ fn overflow_event() -> LiveTranslateServerEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn withdrawal_discards_only_its_queued_source_draft_before_delivery() {
+        let draft = |id| LiveTranslateServerEvent::SourceUtteranceDraft {
+            utterance_id: id,
+            text: "Synthetic source draft.".into(),
+            language: None,
+        };
+        let withdrawal = LiveTranslateServerEvent::SubtitlePreviewWithdrawn {
+            source_utterance_id: 2,
+        };
+        let (sender, mut receiver) = provider_event_channel();
+        sender.send(draft(2)).unwrap();
+        sender.send(withdrawal.clone()).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), withdrawal);
+        assert!(receiver.try_recv().is_err());
+
+        let (sender, mut receiver) = provider_event_channel();
+        sender.send(draft(3)).unwrap();
+        let translation = LiveTranslateServerEvent::TranslationDraft(
+            "Synthetic older in-flight translation.".into(),
+        );
+        sender.send(translation.clone()).unwrap();
+        sender.send(withdrawal.clone()).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), withdrawal);
+        assert_eq!(receiver.try_recv().unwrap(), draft(3));
+        assert_eq!(receiver.try_recv().unwrap(), translation);
+        sender.advance_content_revision();
+        sender.send(draft(2)).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), draft(2));
+    }
+
+    #[test]
+    fn sequential_withdrawals_cannot_resurrect_the_first_queued_draft() {
+        let (sender, mut receiver) = provider_event_channel();
+        sender
+            .send(LiveTranslateServerEvent::SourceUtteranceDraft {
+                utterance_id: 1,
+                text: "Synthetic withdrawn first draft.".into(),
+                language: None,
+            })
+            .unwrap();
+        for id in [1, 2] {
+            sender
+                .send(LiveTranslateServerEvent::SubtitlePreviewWithdrawn {
+                    source_utterance_id: id,
+                })
+                .unwrap();
+        }
+        for id in [1, 2] {
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                LiveTranslateServerEvent::SubtitlePreviewWithdrawn {
+                    source_utterance_id: id
+                }
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+    }
 
     fn identified_preview(id: &str, text: &str) -> LiveTranslateServerEvent {
         LiveTranslateServerEvent::SubtitleIdentifiedPreviewPair {

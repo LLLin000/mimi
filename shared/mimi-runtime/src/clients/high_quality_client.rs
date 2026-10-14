@@ -1026,6 +1026,7 @@ impl HighQualityTranslationClient {
     ) {
         let text = trim(&text);
         if text.is_empty() {
+            self.retire_empty_server_final(source_utterance_id).await;
             return;
         }
         let Some(utterance_revision) = self.prepare_server_final(&text, source_utterance_id).await
@@ -1049,6 +1050,36 @@ impl HighQualityTranslationClient {
             source_utterance_id,
         )
         .await;
+    }
+
+    async fn retire_empty_server_final(&self, source_utterance_id: Option<u64>) {
+        let Some(id) = source_utterance_id.filter(|id| *id > 0) else {
+            return;
+        };
+        let mut inner = self.inner.lock().await;
+        if inner
+            .last_source_utterance_id
+            .is_some_and(|last| id <= last)
+        {
+            return;
+        }
+        inner.last_source_utterance_id = Some(id);
+        // A delayed empty completion cannot withdraw a newer source or touch
+        // ordered durable work. Only this source's current draft is revoked.
+        if inner.current_source_utterance_id == Some(id) {
+            abort_task(&mut inner.draft_stability_task);
+            abort_task(&mut inner.draft_maximum_wait_task);
+            self.cancel_preview(&mut inner, PreviewCancellationReason::SourceFinal);
+            self.advance_preview_epoch();
+            inner.committer.reset();
+            inner.latest_draft_language = None;
+            inner.current_source_utterance_id = None;
+            next_nonzero(&mut inner.draft_revision);
+            inner.preview_request_pacer.finish_utterance();
+        }
+        self.emit(LiveTranslateServerEvent::SubtitlePreviewWithdrawn {
+            source_utterance_id: id,
+        });
     }
 
     async fn prepare_server_final(
@@ -2656,6 +2687,390 @@ mod tests {
     use crate::clients::provider_events::ProviderEventReceiver;
     use crate::core::models::TranslationMode;
     use crate::core::provider::ProviderKind;
+
+    #[tokio::test]
+    async fn custom_recognition_completion_contracts_reach_the_public_pipeline_and_controller() {
+        use crate::core::network_proxy::{ProxyConfig, ProxyMode};
+        use crate::core::session::TranslationSessionController;
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::{json, Value};
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let contract: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../translation-contracts.json"
+        )))
+        .unwrap();
+        for case in contract["customRecognitionCompletions"].as_array().unwrap() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let configuration = LiveTranslationConfiguration::with_credentials(
+                ProviderKind::CustomOpenAIASR,
+                ProviderCredentials::CustomSpeech {
+                    endpoint: format!("ws://{}/v1/realtime", listener.local_addr().unwrap()),
+                    model: "synthetic-model".into(),
+                    api_key: "synthetic-only".into(),
+                },
+                SourceLanguage::English,
+                TargetLanguage::Original,
+                TranslationMode::Turbo,
+            )
+            .validated()
+            .unwrap();
+            let (events, mut receiver) = provider_event_channel();
+            let mut client =
+                HighQualityTranslationClient::new_custom(&configuration, events).unwrap();
+            let network = ProviderNetwork::resolve(&ProxyConfig {
+                mode: ProxyMode::Direct,
+                url: None,
+            })
+            .unwrap();
+            client.set_stage_networks(network.clone(), network).unwrap();
+            let (draft_observed_tx, draft_observed_rx) = oneshot::channel();
+            let (completion_sent_tx, completion_sent_rx) = oneshot::channel();
+            let draft = case["draft"].as_str().unwrap().to_owned();
+            let server_draft = draft.clone();
+            let completion = case["completion"].clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let mut setup: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(setup["type"], "session.update");
+                setup["type"] = json!("session.updated");
+                socket
+                    .send(Message::Text(setup.to_string().into()))
+                    .await
+                    .unwrap();
+                loop {
+                    let message = socket.next().await.unwrap().unwrap();
+                    if let Message::Text(text) = message {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["type"] == "input_audio_buffer.commit" {
+                            break;
+                        }
+                    }
+                }
+                for frame in [
+                    json!({"type":"input_audio_buffer.committed", "item_id":"one"}),
+                    json!({"type":"conversation.item.input_audio_transcription.delta", "item_id":"one", "delta":server_draft}),
+                ] {
+                    socket
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                draft_observed_rx.await.unwrap();
+                if !completion.is_null() {
+                    socket.send(Message::Text(json!({"type":"conversation.item.input_audio_transcription.completed", "item_id":"one", "transcript":completion}).to_string().into())).await.unwrap();
+                }
+                completion_sent_tx.send(()).unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
+            });
+            let mut controller = TranslationSessionController::default();
+            controller.begin_session();
+            controller.did_connect();
+            client.connect().await.unwrap();
+            let mut pcm: Vec<u8> = 3000_i16
+                .to_le_bytes()
+                .into_iter()
+                .cycle()
+                .take(960)
+                .collect();
+            pcm.extend(vec![0; 30 * 960]);
+            client.send_audio(&pcm).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = receiver.recv().await.unwrap();
+                    let observed = matches!(&event, LiveTranslateServerEvent::SourceUtteranceDraft { text, .. } if text == &draft);
+                    controller.handle(event);
+                    if observed { break; }
+                }
+            }).await.unwrap();
+            draft_observed_tx.send(()).unwrap();
+            completion_sent_rx.await.unwrap();
+            controller.begin_stopping();
+            client.finish().await;
+            while let Ok(event) = receiver.try_recv() {
+                controller.handle(event);
+            }
+            server.await.unwrap();
+            let sources = controller
+                .state
+                .subtitles
+                .history
+                .iter()
+                .map(|pair| pair.source.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                serde_json::to_value(sources).unwrap(),
+                case["expected"]["confirmedSources"],
+                "{}",
+                case["id"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_completion_cancels_only_its_preview_and_preserves_confirmed_display() {
+        use crate::core::session::TranslationSessionController;
+        let (client, mut receiver) = test_client(TargetLanguage::Japanese, 20);
+        let mut controller = TranslationSessionController::default();
+        controller.handle(LiveTranslateServerEvent::SubtitleConfirmedPair {
+            utterance_id: 1,
+            source_utterance_id: Some(1),
+            source: "Synthetic confirmed source.".into(),
+            language: Some("en".into()),
+            translation: "Synthetic confirmed translation.".into(),
+        });
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceDraft {
+                utterance_id: 2,
+                text: "Synthetic withdrawn preview.".into(),
+                language: Some("en".into()),
+            })
+            .await;
+        while let Ok(event) = receiver.try_recv() {
+            controller.handle(event);
+        }
+        let preview_id = client.advance_preview_epoch();
+        client.inner.lock().await.preview_task = Some(TaskSlot {
+            id: preview_id,
+            handle: tokio::spawn(std::future::pending()),
+        });
+        let late_partial = client.preview_partial_handler(preview_id);
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceFinal {
+                utterance_id: 2,
+                text: " \t ".into(),
+                language: Some("en".into()),
+            })
+            .await;
+        assert!(!client.preview_is_current(preview_id));
+        assert!(!client.inner.lock().await.committer.has_pending_text());
+        late_partial("Synthetic stale partial.".into());
+        client.emit_preview(
+            preview_id,
+            LiveTranslateServerEvent::SubtitlePreviewPair {
+                source_utterance_id: Some(2),
+                source: "Synthetic stale source.".into(),
+                language: None,
+                translation: "Synthetic stale completion.".into(),
+            },
+        );
+        while let Ok(event) = receiver.try_recv() {
+            controller.handle(event);
+        }
+        assert_eq!(controller.state.subtitles.history.len(), 1);
+        assert!(controller.state.subtitles.display_pair_final);
+        assert_eq!(
+            controller
+                .state
+                .subtitles
+                .display_pair
+                .as_ref()
+                .unwrap()
+                .source,
+            "Synthetic confirmed source."
+        );
+        assert!(controller.state.subtitles.preview_pair.is_none());
+        assert!(controller.state.subtitles.source.text.is_empty());
+        client.flush_pending_draft().await;
+        assert!(client.inner.lock().await.final_queue.is_empty());
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn older_empty_completion_preserves_newer_preview_and_ordered_final_work() {
+        let (client, mut receiver) = test_client(TargetLanguage::Japanese, 20);
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceDraft {
+                utterance_id: 2,
+                text: "Synthetic newer preview.".into(),
+                language: Some("en".into()),
+            })
+            .await;
+        let preview_id = client.advance_preview_epoch();
+        let request = TranslationRequest {
+            text: "Synthetic durable source.".into(),
+            language: Some("en".into()),
+            boundary: FinalBoundary::ServerFinal,
+            utterance_revision: 10,
+            source_utterance_id: Some(1),
+            content_revision: 0,
+            enqueued_at: tokio::time::Instant::now(),
+        };
+        {
+            let mut inner = client.inner.lock().await;
+            inner.preview_task = Some(TaskSlot {
+                id: preview_id,
+                handle: tokio::spawn(std::future::pending()),
+            });
+            inner.final_worker = Some(TaskSlot {
+                id: 99,
+                handle: tokio::spawn(std::future::pending()),
+            });
+            inner.active_final = Some(request.key());
+            inner.final_queue.push_back(request);
+        }
+        while receiver.try_recv().is_ok() {}
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceFinal {
+                utterance_id: 1,
+                text: String::new(),
+                language: Some("en".into()),
+            })
+            .await;
+        let inner = client.inner.lock().await;
+        assert_eq!(inner.last_source_utterance_id, Some(1));
+        assert_eq!(inner.current_source_utterance_id, Some(2));
+        assert_eq!(
+            inner.committer.preview_latest_draft(false).as_deref(),
+            Some("Synthetic newer preview.")
+        );
+        assert_eq!(inner.preview_task.as_ref().unwrap().id, preview_id);
+        assert_eq!(inner.final_worker.as_ref().unwrap().id, 99);
+        assert!(inner.active_final.is_some());
+        assert_eq!(inner.final_queue.len(), 1);
+        drop(inner);
+        assert!(client.preview_is_current(preview_id));
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            LiveTranslateServerEvent::SubtitlePreviewWithdrawn {
+                source_utterance_id: 1
+            }
+        );
+        assert!(receiver.try_recv().is_err());
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceDraft {
+                utterance_id: 1,
+                text: "Synthetic retired replay.".into(),
+                language: Some("en".into()),
+            })
+            .await;
+        assert!(receiver.try_recv().is_err());
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn empty_completion_does_not_withdraw_another_sources_displayed_preview() {
+        use crate::core::session::TranslationSessionController;
+        let (client, mut receiver) = test_client(TargetLanguage::Japanese, 20);
+        let mut controller = TranslationSessionController::default();
+        controller.handle(LiveTranslateServerEvent::SourceUtteranceDraft {
+            utterance_id: 1,
+            text: "Synthetic active final source.".into(),
+            language: Some("en".into()),
+        });
+        controller.handle(LiveTranslateServerEvent::SubtitlePreviewPair {
+            source_utterance_id: Some(1),
+            source: "Synthetic active final source.".into(),
+            language: Some("en".into()),
+            translation: "Synthetic active final preview.".into(),
+        });
+        // The earlier final owns the display while ASR accumulates a new
+        // sentence behind its durable worker. That new draft is not a pair.
+        client.inner.lock().await.final_worker = Some(TaskSlot {
+            id: 99,
+            handle: tokio::spawn(std::future::pending()),
+        });
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceDraft {
+                utterance_id: 2,
+                text: "Synthetic pending source.".into(),
+                language: Some("en".into()),
+            })
+            .await;
+        while let Ok(event) = receiver.try_recv() {
+            controller.handle(event);
+        }
+        let displayed = controller.state.subtitles.display_pair.clone();
+        assert_eq!(
+            displayed.as_ref().unwrap().source,
+            "Synthetic active final source."
+        );
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceFinal {
+                utterance_id: 2,
+                text: String::new(),
+                language: Some("en".into()),
+            })
+            .await;
+        while let Ok(event) = receiver.try_recv() {
+            controller.handle(event);
+        }
+        assert_eq!(controller.state.subtitles.display_pair, displayed);
+        assert_eq!(
+            client.inner.lock().await.final_worker.as_ref().unwrap().id,
+            99
+        );
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn older_empty_completion_withdraws_its_cached_preview_without_touching_the_newer_task() {
+        use crate::core::session::TranslationSessionController;
+        let (client, mut receiver) = test_client(TargetLanguage::Japanese, 20);
+        let mut controller = TranslationSessionController::default();
+        controller.handle(LiveTranslateServerEvent::SourceUtteranceDraft {
+            utterance_id: 1,
+            text: "Synthetic old source.".into(),
+            language: None,
+        });
+        controller.handle(LiveTranslateServerEvent::SubtitlePreviewPair {
+            source_utterance_id: Some(1),
+            source: "Synthetic old source.".into(),
+            language: None,
+            translation: "Synthetic old translation.".into(),
+        });
+        client.inner.lock().await.final_worker = Some(TaskSlot {
+            id: 99,
+            handle: tokio::spawn(std::future::pending()),
+        });
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceDraft {
+                utterance_id: 2,
+                text: "Synthetic newer pending draft.".into(),
+                language: None,
+            })
+            .await;
+        while let Ok(event) = receiver.try_recv() {
+            controller.handle(event);
+        }
+        let preview_id = client.advance_preview_epoch();
+        client.inner.lock().await.preview_task = Some(TaskSlot {
+            id: preview_id,
+            handle: tokio::spawn(std::future::pending()),
+        });
+        assert!(controller.state.subtitles.preview_pair.is_some());
+        client
+            .handle_asr_event(LiveTranslateServerEvent::SourceUtteranceFinal {
+                utterance_id: 1,
+                text: String::new(),
+                language: None,
+            })
+            .await;
+        while let Ok(event) = receiver.try_recv() {
+            controller.handle(event);
+        }
+        assert!(controller.state.subtitles.preview_pair.is_none());
+        assert!(controller.state.subtitles.display_pair.is_none());
+        let inner = client.inner.lock().await;
+        assert_eq!(inner.current_source_utterance_id, Some(2));
+        assert_eq!(
+            inner.committer.preview_latest_draft(false).as_deref(),
+            Some("Synthetic newer pending draft.")
+        );
+        assert_eq!(inner.preview_task.as_ref().unwrap().id, preview_id);
+        assert_eq!(inner.final_worker.as_ref().unwrap().id, 99);
+        drop(inner);
+        assert!(client.preview_is_current(preview_id));
+        client.disconnect().await;
+    }
 
     fn custom_configuration(
         provider: ProviderKind,

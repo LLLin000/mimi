@@ -656,6 +656,116 @@ it.each([
   expect(actions.selectProfile).not.toHaveBeenCalled();
 });
 
+it("keeps name failure and retry across category hiding and Add cancellation without retaining a replaced secret editor", async () => {
+  vi.useFakeTimers();
+  const snapshot: SettingsSnapshot = { ...settings, profiles: [{ ...profile, provider: "openAIRealtime", credentialState: "present" }] };
+  let rejectSave!: (reason: unknown) => void;
+  actions.updateProfile.mockImplementationOnce(() => new Promise((_, reject) => { rejectSave = reject; }));
+  await render(snapshot);
+  await change('.credential-panel input[type="password"]', "synthetic-unsaved-key");
+  await change(".service-detail__name input", "Unsaved hidden name");
+  await act(async () => vi.advanceTimersByTimeAsync(350));
+  const show = async (visible: boolean) => act(async () => root.render(<><ServiceProfiles settings={snapshot} sessionIsActive={false} visible={visible} /><SettingsToastRegion /></>));
+  await show(false);
+  await act(async () => rejectSave(new Error("private-hidden-failure")));
+  await show(true);
+  expect(host.querySelector<HTMLInputElement>(".service-detail__name input")!.value).toBe("Unsaved hidden name");
+  expect(host.querySelector('.service-detail__name [role="alert"]')).not.toBeNull();
+  const nameField = host.querySelector(".service-detail__name input");
+  await click(I18N.settings.addProfile);
+  await act(async () => host.querySelector<HTMLButtonElement>(".provider-picker__heading button.settings-link")!.click());
+  expect(host.querySelector(".service-detail__name input")).toBe(nameField);
+  expect(host.querySelector('.service-detail__name [role="alert"]')).not.toBeNull();
+  expect(host.querySelector<HTMLInputElement>('.credential-panel input[type="password"]')!.value).toBe("synthetic-unsaved-key");
+  await renderList(snapshot);
+  await click(I18N.settings.backToServices);
+  await act(async () => host.querySelector<HTMLButtonElement>(".service-row__edit")!.click());
+  expect(host.querySelector<HTMLInputElement>(".service-detail__name input")!.value).toBe("Unsaved hidden name");
+  expect(host.querySelector<HTMLInputElement>('.credential-panel input[type="password"]')!.value).toBe("");
+  expect(actions.updateProfile).toHaveBeenCalledTimes(1);
+  expect(host.querySelector('.settings-toast')).toBeNull();
+});
+
+it("keeps pending and failed translation names separate when changing routes and returning", async () => {
+  vi.useFakeTimers();
+  const named: ServiceProfile = { ...profile, credentialState: "present", textTranslation: "openAICompatible",
+    textTranslationNames: { openAICompatible: "Office translator", deepLX: "Local translator" } };
+  let rejectSave!: (reason: unknown) => void;
+  actions.updateProfile.mockImplementationOnce(() => new Promise((_, reject) => { rejectSave = reject; }));
+  await render({ ...settings, profiles: [named] });
+  await change(".translation-name-field input", "Failed office name");
+  const choose = async (name: string) => {
+    await act(async () => host.querySelector<HTMLButtonElement>('.service-stage--translation [role="combobox"]')!.click());
+    await act(async () => [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(option => option.textContent === name)!.click());
+  };
+  await choose("Local translator");
+  expect(actions.updateProfile).toHaveBeenCalledExactlyOnceWith(profile.id, undefined, { textTranslationName: { route: "openAICompatible", name: "Failed office name" } });
+  expect(host.querySelector<HTMLInputElement>(".translation-name-field input")!.value).toBe("Local translator");
+  await act(async () => rejectSave(new Error("private-old-route-failure")));
+  expect(host.querySelector('.translation-name-field [role="alert"]')).toBeNull();
+  await choose("Office translator");
+  expect(host.querySelector<HTMLInputElement>(".translation-name-field input")!.value).toBe("Failed office name");
+  expect(host.querySelector('.translation-name-field [role="alert"]')).not.toBeNull();
+  actions.updateProfile.mockResolvedValueOnce({ ...settings, profiles: [named] });
+  await act(async () => host.querySelector<HTMLButtonElement>('.translation-name-field .auto-save-name-field__error button')!.click());
+  expect(actions.updateProfile).toHaveBeenLastCalledWith(profile.id, undefined, { textTranslationName: { route: "openAICompatible", name: "Failed office name" } });
+  expect(actions.updateProfile).toHaveBeenCalledTimes(2);
+  expect(actions.saveProfileCredentials).not.toHaveBeenCalled();
+});
+
+it.each(["success", "failure"] as const)("cancels queued name writes after confirmed profile deletion before late %s", async outcome => {
+  vi.useFakeTimers();
+  const snapshot = withListPeer({ ...settings, profiles: [{ ...profile, credentialState: "present" }] });
+  let resolveSave!: (value: unknown) => void, rejectSave!: (reason: unknown) => void;
+  actions.updateProfile.mockImplementationOnce(() => new Promise((resolve, reject) => { resolveSave = resolve; rejectSave = reject; }));
+  const remaining = { ...snapshot, activeProfileId: snapshot.profiles[1].id, profiles: [snapshot.profiles[1]] };
+  actions.deleteProfile.mockResolvedValueOnce(remaining);
+  await render(snapshot);
+  await act(async () => host.querySelector<HTMLButtonElement>(".service-row__edit")!.click());
+  await change(".service-detail__name input", "First pending name");
+  await act(async () => vi.advanceTimersByTimeAsync(350));
+  await change(".service-detail__name input", "Queued deleted name");
+  await click(I18N.settings.backToServices);
+  await clickRowAction("delete");
+  await click(I18N.settings.confirmDelete);
+  await render(remaining);
+  await act(async () => outcome === "success" ? resolveSave(snapshot) : rejectSave(new Error("private-deleted-name-failure")));
+  await act(async () => vi.advanceTimersByTimeAsync(700));
+  expect(actions.updateProfile).toHaveBeenCalledExactlyOnceWith(profile.id, "First pending name");
+  expect(host.querySelector<HTMLInputElement>(".service-detail__name input")!.value).toBe("Other configuration");
+  expect(host.querySelector('.service-detail__name [role="alert"]')).toBeNull();
+});
+
+it("retains a name draft after failed profile deletion and a late name-save failure", async () => {
+  vi.useFakeTimers();
+  let rejectSave!: (reason: unknown) => void;
+  actions.updateProfile.mockImplementationOnce(() => new Promise((_, reject) => { rejectSave = reject; }));
+  actions.deleteProfile.mockRejectedValueOnce(new Error("private-delete-failure"));
+  await renderList();
+  await act(async () => host.querySelector<HTMLButtonElement>(".service-row__edit")!.click());
+  await change(".service-detail__name input", "Failed retained name");
+  await click(I18N.settings.backToServices);
+  await clickRowAction("delete");
+  await click(I18N.settings.confirmDelete);
+  await act(async () => rejectSave(new Error("private-save-failure")));
+  await act(async () => host.querySelector<HTMLButtonElement>(".service-row__edit")!.click());
+  expect(host.querySelector<HTMLInputElement>(".service-detail__name input")!.value).toBe("Failed retained name");
+  expect(host.querySelector('.service-detail__name .auto-save-name-field__error button')).not.toBeNull();
+  expect(actions.updateProfile).toHaveBeenCalledTimes(1);
+});
+
+it("discards an unflushed name when a settings event removes its profile before editor cleanup", async () => {
+  vi.useFakeTimers();
+  const snapshot = withListPeer();
+  await render(snapshot);
+  await act(async () => host.querySelector<HTMLButtonElement>(".service-row__edit")!.click());
+  await change(".service-detail__name input", "Deleted profile draft");
+  await render({ ...snapshot, activeProfileId: snapshot.profiles[1].id, profiles: [snapshot.profiles[1]] });
+  await act(async () => vi.advanceTimersByTimeAsync(700));
+  expect(actions.updateProfile).not.toHaveBeenCalled();
+  expect(host.querySelector<HTMLInputElement>(".service-detail__name input")!.value).toBe("Other configuration");
+});
+
 it("allows cancelling a provider preview after the session starts while keeping creation blocked", async () => {
   await render();
   await click(I18N.settings.addProfile);
@@ -1530,6 +1640,44 @@ it("keeps a failed recognition-name draft available for retry without touching c
   expect(actions.saveProfileCredentials).not.toHaveBeenCalled();
   expect(actions.selectProfile).not.toHaveBeenCalled();
   expect(profileRevealCredential).not.toHaveBeenCalled();
+});
+
+it.each([
+  [".service-detail__name", "Unsaved configuration", "profile"],
+  [".recognition-name-field", "Unsaved recognizer", "recognition"],
+  [".translation-name-field", "Unsaved translator", "translation"],
+] as const)("retains a failed %s name after leaving its editor and returns with an explicit retry", async (field, draft, kind) => {
+  vi.useFakeTimers();
+  const named: ServiceProfile = { ...profile, provider: "customOpenAIASR", credentialState: "present", speechCredentialState: "present",
+    speechRecognitionName: "Recognizer", textTranslation: "deepLX", textTranslationNames: { deepLX: "Translator" } };
+  const snapshot = { ...settings, profiles: [named] };
+  let rejectSave!: (reason: unknown) => void;
+  actions.updateProfile.mockImplementationOnce(() => new Promise((_, reject) => { rejectSave = reject; }));
+  await renderList(snapshot);
+  await act(async () => host.querySelector<HTMLButtonElement>(".service-row__edit")!.click());
+  await change(`${field} input`, draft);
+  await click(I18N.settings.backToServices);
+  const args = kind === "profile" ? [profile.id, draft] : [profile.id, undefined,
+    kind === "recognition" ? { speechRecognitionName: draft } : { textTranslationName: { route: "deepLX", name: draft } }];
+  expect(actions.updateProfile).toHaveBeenCalledExactlyOnceWith(...args);
+  await act(async () => rejectSave(new Error("synthetic-private-save-failure")));
+  await act(async () => host.querySelectorAll<HTMLButtonElement>(".service-row__edit")[1].click());
+  expect(host.querySelector<HTMLInputElement>(".service-detail__name input")!.value).toBe("Other configuration");
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  await click(I18N.settings.backToServices);
+  await act(async () => host.querySelector<HTMLButtonElement>(".service-row__edit")!.click());
+  expect(host.querySelector<HTMLInputElement>(`${field} input`)!.value).toBe(draft);
+  expect(host.querySelector(`${field} [role="alert"]`)?.textContent).toContain(I18N.settings.profileActionFailed);
+  expect(host.textContent).not.toContain("synthetic-private-save-failure");
+  await act(async () => vi.advanceTimersByTimeAsync(700));
+  expect(actions.updateProfile).toHaveBeenCalledTimes(1);
+  actions.updateProfile.mockResolvedValueOnce(snapshot);
+  await act(async () => host.querySelector<HTMLButtonElement>(`${field} .auto-save-name-field__error button`)!.click());
+  expect(actions.updateProfile).toHaveBeenCalledTimes(2);
+  expect(actions.updateProfile).toHaveBeenLastCalledWith(...args);
+  expect(host.querySelector(`${field} [role="alert"]`)).toBeNull();
+  expect(actions.saveProfileCredentials).not.toHaveBeenCalled();
+  expect(actions.selectProfile).not.toHaveBeenCalled();
 });
 
 it("disables recognition-name editing during an active session", async () => {

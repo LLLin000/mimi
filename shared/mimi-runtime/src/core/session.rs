@@ -293,6 +293,14 @@ impl SourceSessionController {
                 self.subtitle_reducer
                     .apply(crate::core::models::SubtitleEvent::ClearPreview);
             }
+            LiveTranslateServerEvent::SubtitlePreviewWithdrawn {
+                source_utterance_id,
+            } => {
+                self.subtitle_reducer
+                    .apply(crate::core::models::SubtitleEvent::WithdrawPreview {
+                        source_utterance_id,
+                    });
+            }
             LiveTranslateServerEvent::UtteranceText {
                 utterance_id,
                 role,

@@ -425,6 +425,11 @@ page must include a review of other instances of the same pattern.
   status visible; source previews belong only to Original/same-language mode.
   Changing preview kind or removing a preview must immediately invalidate the
   text stabilizer's old display value.
+- An identified empty ASR completion withdraws that source's preview and stop
+  fallback. Keep the withdrawal identified through the shared reducer: the
+  latest recognition draft and the displayed pair may have different owners.
+  Reliable withdrawal must consume its earlier matching queued draft before
+  another withdrawal arrives; other source owners and durable finals survive.
 - Keep accessibility state in `aria-*`, but drive changing selected/checked
   visuals through explicit React class names. macOS WKWebView has previously
   left attribute-selector styling stale after the underlying state changed;
@@ -516,6 +521,18 @@ diff for credentials, recordings, subtitle content, personal paths, build
 artifacts, and signing material.
 
 ## Configuration input and development-mode acceptance
+
+- Desktop autosave names need an owner that survives editor navigation, keyed
+  by profile and field/translation route. A late failed save must retain its
+  draft and inline retry; confirmed deletion cancels queued writes. Check
+  StrictMode cleanup and interrupted IME composition: leaving an editor before
+  composition ends must not persist its preedit text.
+- Android editor view-state saving remains disabled for credentials. Preserve
+  unsaved fields across configuration recreation in an Activity-owned plain
+  ViewModel, without Bundle/SavedStateHandle, views or network calls. Bind the
+  draft to profile/provider identity, preserve each translation route's key
+  removal intent, retain fresh storage/session guards and release on finish.
+  Process death reloads persisted configuration; it cannot restore RAM secrets.
 
 - Before replacing the canonical development app, identify the source revision
   and any unpublished provider support in the running build. A stable signature

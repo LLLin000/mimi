@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { act, type ComponentProps } from "react";
+import { act, StrictMode, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { I18N } from "../../lib/i18n";
 import { AutoSaveNameField } from "./AutoSaveNameField";
+import { NameDraftContext, NameDraftOwner } from "./nameDraftOwner";
 
 let host: HTMLDivElement, root: Root;
 const save = vi.fn<(name: string) => Promise<unknown>>();
@@ -44,6 +45,102 @@ function deferred() {
   const promise = new Promise<unknown>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+
+async function renderOwned(owner: NameDraftOwner, profileId = "first", props: Partial<ComponentProps<typeof AutoSaveNameField>> = {}, shown = true) {
+  await act(() => root.render(<StrictMode><NameDraftContext.Provider value={{ owner, profileId }}>
+    {shown ? <AutoSaveNameField key={profileId} id="name" draftKey="profile" label="Name" value="Original" placeholder="Default" onSave={save} {...props} /> : <div>List</div>}
+  </NameDraftContext.Provider></StrictMode>));
+}
+
+it.each(["success", "failure"] as const)("coalesces a remounted owner's newer edit after late %s without changing another profile", async outcome => {
+  const owner = new NameDraftOwner(), first = deferred(), latest = deferred();
+  const otherSave = vi.fn().mockResolvedValue({});
+  save.mockReturnValueOnce(first.promise).mockReturnValueOnce(latest.promise);
+  await renderOwned(owner); await change("First request"); await tick();
+  await renderOwned(owner, "other", { value: "Other profile", onSave: otherSave });
+  expect(input().value).toBe("Other profile");
+  await renderOwned(owner);
+  expect(input().value).toBe("First request");
+  await change("Latest request"); await tick();
+  expect(save).toHaveBeenCalledTimes(1);
+  await act(async () => outcome === "success" ? first.resolve({}) : first.reject(new Error("private-old-failure")));
+  expect(save).toHaveBeenCalledTimes(2);
+  expect(save).toHaveBeenLastCalledWith("Latest request");
+  expect(input().value).toBe("Latest request");
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  await renderOwned(owner, "other", { value: "Other profile", onSave: otherSave });
+  await act(async () => latest.resolve({}));
+  expect(input().value).toBe("Other profile");
+  expect(otherSave).not.toHaveBeenCalled();
+  await renderOwned(owner);
+  expect(input().value).toBe("Latest request");
+  expect(save).toHaveBeenCalledTimes(2);
+});
+
+it("preserves a late success until source acknowledgement and accepts the next external update while offscreen", async () => {
+  const owner = new NameDraftOwner(), pending = deferred();
+  save.mockReturnValueOnce(pending.promise);
+  await renderOwned(owner); await change("Saved name");
+  await renderOwned(owner, "first", {}, false);
+  await act(async () => pending.resolve({}));
+  await renderOwned(owner);
+  expect(input().value).toBe("Saved name");
+  await renderOwned(owner, "first", {}, false);
+  await act(async () => owner.sync([{ id: "first", name: "Saved name", provider: "alibabaCloud", credentialState: "present" }]));
+  await renderOwned(owner, "first", { value: "External name" });
+  expect(input().value).toBe("External name");
+  expect(save).toHaveBeenCalledExactlyOnceWith("Saved name");
+});
+
+it("discards a deleted owner's queued write and isolates late failure from its replacement", async () => {
+  const owner = new NameDraftOwner(), pending = deferred();
+  save.mockReturnValueOnce(pending.promise);
+  await renderOwned(owner); await change("Pending old name"); await tick();
+  await change("Queued old name");
+  await renderOwned(owner, "first", {}, false);
+  owner.discard("first");
+  await renderOwned(owner, "first", { value: "Replacement profile" });
+  await act(async () => pending.reject(new Error("private-deleted-profile-failure")));
+  expect(input().value).toBe("Replacement profile");
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  expect(save).toHaveBeenCalledExactlyOnceWith("Pending old name");
+  await change("Replacement edit"); await tick();
+  expect(save).toHaveBeenCalledTimes(2);
+  expect(save).toHaveBeenLastCalledWith("Replacement edit");
+});
+
+it("releases a failed draft explicitly replaced with the confirmed value without retrying it", async () => {
+  const owner = new NameDraftOwner();
+  save.mockRejectedValueOnce(new Error("private-failure"));
+  await renderOwned(owner); await change("Discarded name"); await tick();
+  expect(host.querySelector('[role="alert"]')).not.toBeNull();
+  await change("Original");
+  await renderOwned(owner, "first", {}, false);
+  await renderOwned(owner, "first", { value: "External name" });
+  expect(input().value).toBe("External name");
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  expect(save).toHaveBeenCalledExactlyOnceWith("Discarded name");
+});
+
+it("keeps interrupted IME preedit across navigation without saving it before a new edit or explicit confirmation", async () => {
+  const owner = new NameDraftOwner();
+  await renderOwned(owner);
+  await act(() => input().dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })));
+  await change("wei"); await tick();
+  await renderOwned(owner, "first", {}, false);
+  expect(save).not.toHaveBeenCalled();
+  await renderOwned(owner); await tick();
+  expect(input().value).toBe("wei");
+  expect(save).not.toHaveBeenCalled();
+  await change("New committed edit"); await tick();
+  expect(save).toHaveBeenCalledExactlyOnceWith("New committed edit");
+  await act(() => input().dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })));
+  await change("plain");
+  await renderOwned(owner, "first", {}, false);
+  await renderOwned(owner);
+  expect((await key("Enter")).defaultPrevented).toBe(true);
+  expect(save).toHaveBeenLastCalledWith("plain");
+});
 
 it("quietly debounces repeated edits while preserving focus, raw spaces, punctuation and emoji", async () => {
   await render(); await act(() => input().focus());

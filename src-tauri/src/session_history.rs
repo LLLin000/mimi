@@ -5,7 +5,7 @@ use crate::core::session_archive::{SavedTranscript, TranscriptPage, AUDIO_BYTE_L
 use serde::Serialize;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const MAX_TRANSCRIPT_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -294,9 +294,6 @@ impl SessionHistory {
             for source in audio_sources {
                 let pcm_path = self.audio_path(id, source, "pcm")?;
                 let audio_path = self.audio_path(id, source, "wav")?;
-                if audio_path.exists() {
-                    continue;
-                }
                 let mut input = fs::File::open(pcm_path)?;
                 let length = input.metadata()?.len().saturating_sub(4);
                 if length > AUDIO_BYTE_LIMIT as u64 || !length.is_multiple_of(2) {
@@ -313,6 +310,9 @@ impl SessionHistory {
                         io::ErrorKind::InvalidData,
                         "invalid audio rate",
                     ));
+                }
+                if verified_existing_wav(&audio_path, rate, length, &mut input)? {
+                    continue;
                 }
                 let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)?;
                 temporary.write_all(&wav_header(rate, length as u32))?;
@@ -502,6 +502,75 @@ impl SessionHistory {
         }
         Ok(())
     }
+}
+
+/// Reuse only a completed conversion of this pending PCM track. Existing
+/// outputs are compared with bounded buffers before the journal is consumed.
+fn verified_existing_wav(
+    path: &Path,
+    rate: u32,
+    pcm_length: u64,
+    pcm: &mut fs::File,
+) -> io::Result<bool> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid existing audio");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != pcm_length + 44
+    {
+        return Err(invalid());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(target_os = "macos")]
+        options.custom_flags(0x100); // O_NOFOLLOW
+        #[cfg(not(target_os = "macos"))]
+        options.custom_flags(0x20000);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.file_type().is_symlink() || opened.len() != metadata.len() {
+        return Err(invalid());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+            return Err(invalid());
+        }
+    }
+    let mut header = [0_u8; 44];
+    file.read_exact(&mut header)?;
+    if header != wav_header(rate, pcm_length as u32) {
+        return Err(invalid());
+    }
+    let mut wave_bytes = [0_u8; 8192];
+    let mut pcm_bytes = [0_u8; 8192];
+    let mut remaining = pcm_length as usize;
+    while remaining > 0 {
+        let count = remaining.min(wave_bytes.len());
+        file.read_exact(&mut wave_bytes[..count])?;
+        pcm.read_exact(&mut pcm_bytes[..count])?;
+        if wave_bytes[..count] != pcm_bytes[..count] {
+            return Err(invalid());
+        }
+        remaining -= count;
+    }
+    let mut tail = [0_u8; 1];
+    if file.read(&mut tail)? != 0 || pcm.read(&mut tail)? != 0 {
+        return Err(invalid());
+    }
+    Ok(true)
 }
 
 fn wav_header(rate: u32, length: u32) -> [u8; 44] {
@@ -763,5 +832,265 @@ mod tests {
             .append_pcm_from(&id, AudioSource::Microphone, 16_000, &[2, 0])
             .is_err());
         assert_eq!(history.audio_sources(&id).unwrap(), [AudioSource::System]);
+    }
+
+    fn pending_audio(history: &SessionHistory, source: AudioSource, rate: u32) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        history.begin(&id, 100).unwrap();
+        history
+            .append_pair(
+                &id,
+                &SubtitlePair::new(
+                    "Synthetic original".into(),
+                    "Synthetic translation".into(),
+                    150,
+                ),
+            )
+            .unwrap();
+        history
+            .append_pcm_from(&id, source, rate, &[1, 0, 2, 0])
+            .unwrap();
+        id
+    }
+
+    fn synthetic_wav(rate: u32) -> Vec<u8> {
+        let mut wav = wav_header(rate, 4).to_vec();
+        wav.extend_from_slice(&[1, 0, 2, 0]);
+        wav
+    }
+
+    fn assert_pending_audio(history: &SessionHistory, id: &str, source: AudioSource, rate: u32) {
+        let mut expected = rate.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[1, 0, 2, 0]);
+        assert_eq!(
+            fs::read(history.audio_path(id, source, "pcm").unwrap()).unwrap(),
+            expected
+        );
+        assert!(history.path(id, "jsonl").unwrap().is_file());
+        assert!(!history.path(id, "json").unwrap().exists());
+    }
+
+    #[test]
+    fn finalization_preserves_pcm_when_wav_output_is_not_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        for source in [AudioSource::System, AudioSource::Microphone] {
+            let id = pending_audio(&history, source, 16_000);
+            let wav = history.audio_path(&id, source, "wav").unwrap();
+            fs::create_dir(&wav).unwrap();
+            assert!(history.finalize(&id, 200, false).is_err());
+            assert_pending_audio(&history, &id, source, 16_000);
+            fs::remove_dir(&wav).unwrap();
+            assert!(history.finalize(&id, 200, false).unwrap());
+            assert_eq!(
+                history.audio_from(&id, source).unwrap(),
+                synthetic_wav(16_000)
+            );
+        }
+    }
+
+    #[test]
+    fn finalization_rejects_invalid_existing_wav_without_consuming_pcm() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        for source in [AudioSource::System, AudioSource::Microphone] {
+            for damage in [
+                "empty",
+                "header",
+                "format",
+                "channels",
+                "rate",
+                "bits",
+                "data_length",
+                "truncated",
+                "trailing",
+                "different_pcm_length",
+                "different_pcm",
+                "oversized",
+            ] {
+                let id = pending_audio(&history, source, 16_000);
+                let path = history.audio_path(&id, source, "wav").unwrap();
+                let mut wav = synthetic_wav(16_000);
+                match damage {
+                    "empty" => wav.clear(),
+                    "header" => wav[0] = b'X',
+                    "format" => wav[20..22].copy_from_slice(&3_u16.to_le_bytes()),
+                    "channels" => wav[22..24].copy_from_slice(&2_u16.to_le_bytes()),
+                    "rate" => wav = synthetic_wav(24_000),
+                    "bits" => wav[34..36].copy_from_slice(&8_u16.to_le_bytes()),
+                    "data_length" => wav[40..44].copy_from_slice(&2_u32.to_le_bytes()),
+                    "truncated" => wav.truncate(wav.len() - 2),
+                    "trailing" => wav.extend_from_slice(&[3, 0]),
+                    "different_pcm_length" => {
+                        wav = wav_header(16_000, 2).to_vec();
+                        wav.extend_from_slice(&[1, 0]);
+                    }
+                    "different_pcm" => wav[44] ^= 1,
+                    "oversized" => {}
+                    _ => unreachable!(),
+                }
+                fs::write(&path, &wav).unwrap();
+                if damage == "oversized" {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(AUDIO_BYTE_LIMIT as u64 + 45)
+                        .unwrap();
+                }
+                assert!(
+                    history.finalize(&id, 200, false).is_err(),
+                    "source={source:?} damage={damage}"
+                );
+                assert_pending_audio(&history, &id, source, 16_000);
+                fs::remove_file(&path).unwrap();
+                assert!(history.finalize(&id, 200, false).unwrap());
+                assert_eq!(
+                    history.audio_from(&id, source).unwrap(),
+                    synthetic_wav(16_000)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalization_rejects_wav_symlinks_without_touching_saved_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        let saved_id = pending_audio(&history, AudioSource::System, 16_000);
+        history.finalize(&saved_id, 200, false).unwrap();
+        let saved_wav = history
+            .audio_path(&saved_id, AudioSource::System, "wav")
+            .unwrap();
+        for source in [AudioSource::System, AudioSource::Microphone] {
+            for target in [&saved_wav, &directory.path().join("missing.wav")] {
+                let id = pending_audio(&history, source, 16_000);
+                let path = history.audio_path(&id, source, "wav").unwrap();
+                std::os::unix::fs::symlink(target, &path).unwrap();
+                assert!(history.finalize(&id, 200, false).is_err());
+                assert_pending_audio(&history, &id, source, 16_000);
+                assert!(fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert_eq!(history.audio(&saved_id).unwrap(), synthetic_wav(16_000));
+                fs::remove_file(&path).unwrap();
+                assert!(history.finalize(&id, 200, false).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn finalization_reuses_valid_wav_from_an_interrupted_conversion() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        for (source, rate) in [
+            (AudioSource::System, 16_000),
+            (AudioSource::Microphone, 24_000),
+        ] {
+            let id = pending_audio(&history, source, rate);
+            let path = history.audio_path(&id, source, "wav").unwrap();
+            let wav = synthetic_wav(rate);
+            fs::write(&path, &wav).unwrap();
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            assert!(history.finalize(&id, 200, false).unwrap());
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            assert_eq!(history.audio_from(&id, source).unwrap(), wav);
+            assert!(!history.audio_path(&id, source, "pcm").unwrap().exists());
+            assert!(!history.path(&id, "jsonl").unwrap().exists());
+            assert_eq!(history.page(&id, "", 0).unwrap().total, 1);
+        }
+    }
+
+    #[test]
+    fn finalization_compares_existing_wav_payload_through_the_last_chunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        let pcm = [1, 0].repeat(8193);
+        for (source, rate) in [
+            (AudioSource::System, 16_000),
+            (AudioSource::Microphone, 24_000),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            history.begin(&id, 100).unwrap();
+            history.append_pcm_from(&id, source, rate, &pcm).unwrap();
+            let path = history.audio_path(&id, source, "wav").unwrap();
+            let mut wav = wav_header(rate, pcm.len() as u32).to_vec();
+            wav.extend_from_slice(&pcm);
+            *wav.last_mut().unwrap() ^= 1;
+            fs::write(&path, &wav).unwrap();
+            assert!(history.finalize(&id, 200, false).is_err());
+            assert_eq!(fs::read(&path).unwrap(), wav);
+            let mut expected_pcm = rate.to_le_bytes().to_vec();
+            expected_pcm.extend_from_slice(&pcm);
+            assert_eq!(
+                fs::read(history.audio_path(&id, source, "pcm").unwrap()).unwrap(),
+                expected_pcm
+            );
+            assert!(history.path(&id, "jsonl").unwrap().is_file());
+            assert!(!history.path(&id, "json").unwrap().exists());
+            *wav.last_mut().unwrap() ^= 1;
+            fs::write(&path, &wav).unwrap();
+            assert!(history.finalize(&id, 200, false).unwrap());
+            assert_eq!(history.audio_from(&id, source).unwrap(), wav);
+        }
+    }
+
+    #[test]
+    fn finalization_retries_dual_input_after_one_wav_output_is_blocked() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        for existing_system_wav in [false, true] {
+            let id = pending_audio(&history, AudioSource::System, 16_000);
+            history
+                .append_pcm_from(&id, AudioSource::Microphone, 24_000, &[1, 0, 2, 0])
+                .unwrap();
+            let system = history.audio_path(&id, AudioSource::System, "wav").unwrap();
+            let microphone = history
+                .audio_path(&id, AudioSource::Microphone, "wav")
+                .unwrap();
+            if existing_system_wav {
+                fs::write(&system, synthetic_wav(16_000)).unwrap();
+            }
+            fs::create_dir(&microphone).unwrap();
+            assert!(history.finalize(&id, 200, false).is_err());
+            assert_pending_audio(&history, &id, AudioSource::System, 16_000);
+            assert_pending_audio(&history, &id, AudioSource::Microphone, 24_000);
+            assert_eq!(system.is_file(), existing_system_wav);
+            fs::remove_dir(&microphone).unwrap();
+            assert!(history.finalize(&id, 200, false).unwrap());
+            assert_eq!(
+                history.audio_from(&id, AudioSource::System).unwrap(),
+                synthetic_wav(16_000)
+            );
+            assert_eq!(
+                history.audio_from(&id, AudioSource::Microphone).unwrap(),
+                synthetic_wav(24_000)
+            );
+            assert!(history.audio_selected(&id, None).is_err());
+        }
+    }
+
+    #[test]
+    fn finalization_never_replaces_an_existing_saved_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        let id = pending_audio(&history, AudioSource::System, 16_000);
+        history.finalize(&id, 200, false).unwrap();
+        let saved = fs::read(history.path(&id, "json").unwrap()).unwrap();
+        let wav = history.audio(&id).unwrap();
+        history.begin(&id, 300).unwrap();
+        history
+            .append_pcm_from(&id, AudioSource::System, 16_000, &[1, 0, 2, 0])
+            .unwrap();
+        assert!(history.finalize(&id, 400, false).is_err());
+        assert_eq!(fs::read(history.path(&id, "json").unwrap()).unwrap(), saved);
+        assert_eq!(history.audio(&id).unwrap(), wav);
+        assert!(history.path(&id, "jsonl").unwrap().is_file());
+        assert!(history
+            .audio_path(&id, AudioSource::System, "pcm")
+            .unwrap()
+            .is_file());
     }
 }

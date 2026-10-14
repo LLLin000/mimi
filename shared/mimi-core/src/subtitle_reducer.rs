@@ -283,6 +283,7 @@ impl<A: ArchiveSink> SubtitleReducer<A> {
             SubtitleEvent::SourceUtteranceDraft { .. }
                 | SubtitleEvent::PreviewPair { .. }
                 | SubtitleEvent::ConfirmedPair { .. }
+                | SubtitleEvent::WithdrawPreview { .. }
         );
         match event {
             SubtitleEvent::SourceBoundary {
@@ -418,6 +419,44 @@ impl<A: ArchiveSink> SubtitleReducer<A> {
                 self.snapshot.preview_pair = None;
                 self.preview_source_utterance_id = None;
                 self.clear_unconfirmed_display_pair();
+            }
+            SubtitleEvent::WithdrawPreview {
+                source_utterance_id,
+            } => {
+                if source_utterance_id == 0 {
+                    return;
+                }
+                let owner = self.source_layout_identity(source_utterance_id);
+                let owns_source = !self.snapshot.source.is_final
+                    && self.snapshot.source.utterance_id.as_deref() == Some(owner.as_str());
+                let owns_preview = self.preview_source_utterance_id == Some(source_utterance_id);
+                let owns_display = !self.snapshot.display_pair_final
+                    && self.display_pair_source_utterance_id == Some(source_utterance_id);
+                if !owns_source && !owns_preview && !owns_display {
+                    return;
+                }
+                if owns_preview {
+                    self.snapshot.preview_pair = None;
+                    self.preview_source_utterance_id = None;
+                }
+                if owns_display {
+                    self.clear_unconfirmed_display_pair();
+                }
+                if owns_source {
+                    self.snapshot.source =
+                        SubtitleLine::for_utterance(String::new(), false, owner.clone());
+                }
+                // Unstamped translation drafts may belong to an older final
+                // still in flight. Only an identified line or complete owned
+                // preview supplies enough evidence to withdraw that line.
+                if !self.snapshot.translation.is_final
+                    && ((owns_source && owns_preview)
+                        || self.snapshot.translation.utterance_id.as_deref()
+                            == Some(owner.as_str()))
+                {
+                    self.snapshot.translation =
+                        SubtitleLine::for_utterance(String::new(), false, owner);
+                }
             }
             SubtitleEvent::UtteranceText {
                 utterance_id,

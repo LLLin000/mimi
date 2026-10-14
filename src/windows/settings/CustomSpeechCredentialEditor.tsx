@@ -87,7 +87,7 @@ export function CustomSpeechCredentialEditor(props: ComponentProps<typeof Alibab
       <header className="service-stage__heading"><div className="service-stage__name-help"><h3 id={`${speechId}-title`}>{I18N.settings.speechRecognition}</h3><SettingsHelp id={helpId} text={requirements} label={I18N.settings.helpLabel} /></div>
       </header>
       <div className="settings-field service-stage__selector"><span>{I18N.settings.serviceProvider}</span><span className="service-stage__provider"><ProviderIcon provider={profile.provider} size={32} />{openAI ? "OpenAI Realtime ASR" : "DashScope ASR"}</span></div>
-      {props.onSaveRecognitionName && <AutoSaveNameField key={profile.id} id={`${speechId}-name`}
+      {props.onSaveRecognitionName && <AutoSaveNameField key={profile.id} id={`${speechId}-name`} draftKey="recognition"
         className="recognition-name-field" label={I18N.settings.speechRecognitionName}
         value={profile.speechRecognitionName ?? ""} placeholder={providerDisplayName(profile.provider)}
         disabled={disabled} allowEmpty onSave={props.onSaveRecognitionName} />}
