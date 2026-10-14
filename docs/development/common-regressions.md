@@ -183,6 +183,19 @@ not establish that the other is healthy.
 
 ## Know which prompt appeared
 
+An Apple-language-pack error can be a settings snapshot failure, including on
+Windows where Apple Speech is unavailable. Check the sanitized catalog-load
+label before diagnosing a platform component. An unreleased provider enum
+(for example `localProgram`) makes the stable profile catalog fail closed;
+extra optional fields alone do not establish that cause. Keep experimental
+schemas in a separate development app directory. For cross-version package QA,
+remember that the Windows portable marker changes update behavior, not the
+production config directory. Preserve and verify the original non-secret files
+before temporary isolation, remove only the test profile through the app,
+then restore the original bytes
+after quitting. Never delete the original catalog or reset credentials to make
+an unrelated UI error disappear.
+
 Production and ordinary development credentials use private local files on all
 desktop platforms. Legacy OS items are read only during automatic upgrade import,
 then deleted after durable write and read-back verification. Completed imports
