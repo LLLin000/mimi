@@ -2880,6 +2880,8 @@ impl OverlayControlWindowManager {
             let native_window = window.clone();
             let _ = window.run_on_main_thread(move || {
                 if let Ok(window) = native_window.gtk_window() {
+                    // A non-resizable GTK window otherwise retains its
+                    // natural 200px height and intercepts invisible clicks.
                     window.set_size_request(geometry.width as i32, geometry.height as i32);
                     window.resize(geometry.width as i32, geometry.height as i32);
                     window.move_(geometry.x.round() as i32, geometry.y.round() as i32);
@@ -2979,22 +2981,38 @@ fn control_mode_for_presentation(
 }
 
 fn measured_webview_zoom(app: &AppHandle, pixel_ratio: f64) -> Option<f64> {
-    if !pixel_ratio.is_finite() || !(0.25..=16.0).contains(&pixel_ratio) {
-        return None;
-    }
     #[cfg(target_os = "windows")]
     {
         let native_scale = app
             .get_webview_window("overlay-control")?
             .scale_factor()
             .ok()?;
-        Some(pixel_ratio / native_scale)
+        windows_webview_zoom(pixel_ratio, native_scale)
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app;
-        Some(1.0)
+        Some(unscaled_webview_zoom(pixel_ratio))
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_webview_zoom(pixel_ratio: f64, native_scale: f64) -> Option<f64> {
+    if !pixel_ratio.is_finite()
+        || !(0.25..=16.0).contains(&pixel_ratio)
+        || !native_scale.is_finite()
+        || !(0.25..=16.0).contains(&native_scale)
+    {
+        return None;
+    }
+    Some(pixel_ratio / native_scale)
+}
+
+/// Only Windows applies WebView text zoom to native control geometry. Ignore
+/// the extra measurement entirely elsewhere, preserving their size updates.
+#[cfg(any(not(target_os = "windows"), test))]
+fn unscaled_webview_zoom(_pixel_ratio: f64) -> f64 {
+    1.0
 }
 
 fn measured_island_width(width: f64) -> Option<f64> {
@@ -4108,6 +4126,45 @@ mod geometry_tests {
         assert_eq!(measured_island_width(10000.0), Some(512.0));
         assert_eq!(measured_island_width(f64::NAN), None);
         assert_eq!(measured_island_width(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn windows_text_zoom_is_independent_of_monitor_dpi_and_rejects_invalid_scales() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            assert_eq!(windows_webview_zoom(scale, scale), Some(1.0));
+            assert!((windows_webview_zoom(scale * 1.2, scale).unwrap() - 1.2).abs() < 0.0001);
+        }
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 17.0] {
+            assert_eq!(windows_webview_zoom(invalid, 1.0), None);
+            assert_eq!(windows_webview_zoom(1.0, invalid), None);
+        }
+    }
+
+    #[test]
+    fn non_windows_dimensions_ignore_pixel_ratio_including_invalid_values() {
+        let state = OverlayControlState::default();
+        for pixel_ratio in [0.0, -1.0, f64::NAN, f64::INFINITY, 1.5, 17.0] {
+            let zoom = unscaled_webview_zoom(pixel_ratio);
+            state.set_panel_height(356.0, zoom);
+            state.set_island_width(148.0, zoom);
+            assert_eq!(state.dimensions(), (148.0, 356.0, 1.0));
+        }
+    }
+
+    #[test]
+    fn unchanged_panel_height_still_reapplies_changed_windows_text_zoom() {
+        let state = OverlayControlState::default();
+        assert!(state.set_panel_height(356.0, 1.0));
+        assert!(!state.set_panel_height(356.0, 1.0));
+        assert!(state.set_panel_height(356.0, 1.2));
+        assert_eq!(
+            state.dimensions(),
+            (
+                OverlayControlWindowManager::DEFAULT_ISLAND_WIDTH,
+                356.0,
+                1.2
+            )
+        );
     }
 
     #[test]

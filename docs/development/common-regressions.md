@@ -291,7 +291,13 @@ Do not reset TCC, change signing or delete system assets without evidence.
 - A `VT_BLOB` activation `PROPVARIANT` borrows the completion handler's parameter
   storage. Do not run `PropVariantClear` on it: that would `CoTaskMemFree` a
   non-owning pointer and corrupt the heap. The handler must retain the payload
-  through asynchronous completion, including cancellation.
+  through asynchronous completion, including cancellation. Keep the outer
+  `PROPVARIANT` behind the lifetime-bound `BorrowedActivationVariant`; wrapping
+  only its inner union in `ManuallyDrop` does not suppress the owning destructor.
+  The Windows regression tests construct and destroy this borrowed variant on
+  both success and early failure. Preserve these native tests, not just source
+  text checks. Any queued audio interface must be released before the worker's
+  COM apartment guard, and a late failed send releases it on the MTA callback.
 - The activation callback and the explicitly initialized capture worker share
   the process MTA. Transfer the owned audio interface within that apartment,
   not through `AgileReference`: `IAudioClient` is a local interface, and an

@@ -216,7 +216,44 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activation_Impl {
     }
 }
 
+// `PROPVARIANT` normally owns its payload: its Drop calls PropVariantClear,
+// which frees VT_BLOB data with CoTaskMemFree. This activation payload instead
+// borrows the completion handler's storage. Suppress the *outer* destructor and
+// carry that borrow in the type; protecting only the inner union is insufficient.
+// Do not expose mutable access, Clone, or an owned PROPVARIANT conversion.
+struct BorrowedActivationVariant<'a> {
+    variant: std::mem::ManuallyDrop<PROPVARIANT>,
+    _params: std::marker::PhantomData<&'a AUDIOCLIENT_ACTIVATION_PARAMS>,
+}
+
+impl<'a> BorrowedActivationVariant<'a> {
+    fn new(params: &'a AUDIOCLIENT_ACTIVATION_PARAMS) -> Self {
+        Self {
+            variant: std::mem::ManuallyDrop::new(PROPVARIANT {
+                Anonymous: PROPVARIANT_0 {
+                    Anonymous: std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
+                        vt: VT_BLOB,
+                        Anonymous: PROPVARIANT_0_0_0 {
+                            blob: BLOB {
+                                cbSize: std::mem::size_of_val(params) as u32,
+                                pBlobData: params as *const _ as *mut u8,
+                            },
+                        },
+                        ..Default::default()
+                    }),
+                },
+            }),
+            _params: std::marker::PhantomData,
+        }
+    }
+
+    fn as_raw(&self) -> &PROPVARIANT {
+        &self.variant
+    }
+}
+
 struct OpenCapture {
+    // Struct fields drop in declaration order, before the apartment guard.
     client: Client,
     capture: IAudioCaptureClient,
     process: Process,
@@ -247,32 +284,16 @@ fn open(
         params,
         tx: Mutex::new(Some(tx)),
     });
-    let params = &activation.get().params;
-    // `blob.pBlobData` borrows `activation`'s storage; it is not a CoTaskMem
-    // allocation. `Drop for PROPVARIANT` calls `PropVariantClear`, which frees
-    // VT_BLOB payloads with `CoTaskMemFree`, so the variant must never be
-    // cleared. Keep the payload alive until activation completes by holding
-    // `activation` (dropped after `_operation`).
-    let variant = std::mem::ManuallyDrop::new(PROPVARIANT {
-        Anonymous: PROPVARIANT_0 {
-            Anonymous: std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
-                vt: VT_BLOB,
-                Anonymous: PROPVARIANT_0_0_0 {
-                    blob: BLOB {
-                        cbSize: std::mem::size_of_val(params) as u32,
-                        pBlobData: params as *const _ as *mut u8,
-                    },
-                },
-                ..Default::default()
-            }),
-        },
-    });
+    // Windows retains the handler until completion even if cancellation drops
+    // our operation reference. It therefore also retains the borrowed payload.
+    // rx is dropped before com, including any queued MTA interface on early exit.
+    let variant = BorrowedActivationVariant::new(&activation.get().params);
     let handler = activation.to_interface::<IActivateAudioInterfaceCompletionHandler>();
     let _operation = unsafe {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(&*variant),
+            Some(variant.as_raw()),
             &handler,
         )
     }
@@ -394,6 +415,69 @@ unsafe fn copy_packet(data: *const u8, frames: u32, flags: u32) -> Option<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn borrowed_activation_scope(
+        params: &AUDIOCLIENT_ACTIVATION_PARAMS,
+        fail: bool,
+    ) -> Result<(), ()> {
+        let variant = BorrowedActivationVariant::new(params);
+        // Inspect the actual ABI payload, then let scope exit destroy the wrapper.
+        // If the outer ManuallyDrop protection regresses, either exit path calls
+        // PropVariantClear on a stack pointer and Windows reports an invalid free.
+        unsafe {
+            let value = &variant.as_raw().Anonymous.Anonymous;
+            assert_eq!(value.vt, VT_BLOB);
+            assert_eq!(
+                value.Anonymous.blob.cbSize as usize,
+                std::mem::size_of_val(params)
+            );
+            assert_eq!(
+                value.Anonymous.blob.pBlobData,
+                params as *const _ as *mut u8
+            );
+        }
+        if fail {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn borrowed_activation_variant_does_not_free_parameters_on_success() {
+        let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                    TargetProcessId: 1234,
+                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                },
+            },
+        };
+        assert_eq!(borrowed_activation_scope(&params, false), Ok(()));
+        assert_eq!(
+            unsafe { params.Anonymous.ProcessLoopbackParams.TargetProcessId },
+            1234
+        );
+    }
+
+    #[test]
+    fn borrowed_activation_variant_does_not_free_parameters_on_early_failure() {
+        let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                    TargetProcessId: 5678,
+                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                },
+            },
+        };
+        assert_eq!(borrowed_activation_scope(&params, true), Err(()));
+        assert_eq!(
+            unsafe { params.Anonymous.ProcessLoopbackParams.TargetProcessId },
+            5678
+        );
+    }
+
     #[test]
     fn silent_packets_do_not_read_undefined_native_bytes() {
         let invalid = std::ptr::dangling::<u8>();

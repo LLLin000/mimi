@@ -11,7 +11,7 @@ import { LanguageSelect } from "../../components/LanguageSelect";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Icon } from "../../components/Icon";
 import { I18N } from "../../lib/i18n";
-import { languageActionErrorMessage, profileErrorMessage, sessionActionErrorMessage } from "../../lib/connectionDiagnostics";
+import { diagnosticPlatform, languageActionErrorMessage, profileErrorMessage, sessionActionErrorMessage } from "../../lib/connectionDiagnostics";
 import {
   isTauri,
   overlayControlSetPanelHeight,
@@ -117,42 +117,63 @@ export function OverlayControlPanel({
 
   useLayoutEffect(() => {
     if (!isTauri || !panelRef.current || !contentRef.current) return;
+    const windowsResize = diagnosticPlatform() === "windows";
+    let active = true;
     let animationFrame = 0;
     let lastHeight = 0;
     let lastPixelRatio = 0;
     let initialResize = true;
+    let measurement = 0;
+    let resizeAcknowledged = false;
+    const revealFocusedControl = () => {
+      if (!windowsResize || !initialResize || !resizeAcknowledged) return;
+      const panel = panelRef.current;
+      const header = panel?.querySelector<HTMLElement>(".overlay-control-header");
+      // IPC completion only queues the native resize. Wait for the WebView's
+      // viewport to expand beyond its island before allowing focus to scroll.
+      if (!panel || !header || window.innerHeight <= header.getBoundingClientRect().height) return;
+      initialResize = false;
+      const focused = document.activeElement;
+      if (focused instanceof HTMLElement && panel.contains(focused)) {
+        focused.scrollIntoView({ block: "nearest" });
+      }
+    };
     const measure = () => {
       animationFrame = 0;
+      if (!active) return;
       const panel = panelRef.current;
       const content = contentRef.current;
       if (!panel || !content) return;
       const height = Math.ceil(
         content.getBoundingClientRect().height + panel.clientTop * 2,
       );
-      const pixelRatio = window.devicePixelRatio;
-      if (height === lastHeight && pixelRatio === lastPixelRatio) return;
+      const pixelRatio = windowsResize ? window.devicePixelRatio : 1;
+      if (height === lastHeight && pixelRatio === lastPixelRatio) {
+        revealFocusedControl();
+        return;
+      }
       lastHeight = height;
       lastPixelRatio = pixelRatio;
+      const currentMeasurement = ++measurement;
+      resizeAcknowledged = false;
       void overlayControlSetPanelHeight(height).then(() => {
-        if (!initialResize) return;
-        initialResize = false;
-        const focused = document.activeElement;
-        if (focused instanceof HTMLElement && panelRef.current?.contains(focused)) {
-          focused.scrollIntoView({ block: "nearest" });
-        }
+        if (!active || !windowsResize || currentMeasurement !== measurement) return;
+        resizeAcknowledged = true;
+        scheduleMeasure();
       }).catch(() => {});
     };
     const scheduleMeasure = () => {
-      if (animationFrame !== 0) return;
+      if (!active || animationFrame !== 0) return;
       animationFrame = window.requestAnimationFrame(measure);
     };
     const observer = new ResizeObserver(scheduleMeasure);
     observer.observe(contentRef.current);
-    window.addEventListener("resize", scheduleMeasure);
+    if (windowsResize) window.addEventListener("resize", scheduleMeasure);
     scheduleMeasure();
     return () => {
+      active = false;
       observer.disconnect();
-      window.removeEventListener("resize", scheduleMeasure);
+      if (windowsResize) window.removeEventListener("resize", scheduleMeasure);
       if (animationFrame !== 0) window.cancelAnimationFrame(animationFrame);
     };
   }, []);
@@ -165,11 +186,12 @@ export function OverlayControlPanel({
       immersiveRef.current,
       lockRef.current,
     ].find((candidate) => candidate != null && !candidate.disabled);
-    // The island viewport is still only 30px tall while the native resize is
-    // pending. Scrolling on focus now would leave the header above the panel.
-    const animationFrame = window.requestAnimationFrame(() =>
-      target?.focus({ preventScroll: isTauri }),
-    );
+    // WebView2 may still have the island viewport while native resize is
+    // pending. Other platforms retain their existing focus/scroll behavior.
+    const animationFrame = window.requestAnimationFrame(() => {
+      if (isTauri && diagnosticPlatform() === "windows") target?.focus({ preventScroll: true });
+      else target?.focus();
+    });
     return () => window.cancelAnimationFrame(animationFrame);
   }, []);
 

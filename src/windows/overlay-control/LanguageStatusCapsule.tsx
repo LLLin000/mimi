@@ -3,6 +3,7 @@ import { Icon } from "../../components/Icon";
 import { AudioInputIndicator } from "../../components/AudioInputIndicator";
 import { audioInputLabel } from "../../lib/audioInput";
 import { I18N } from "../../lib/i18n";
+import { diagnosticPlatform } from "../../lib/connectionDiagnostics";
 import {
   OVERLAY_ACTIVITY_PHASES,
   type OverlayActivityPhaseKind,
@@ -54,11 +55,14 @@ export function LanguageStatusCapsule({
   useLayoutEffect(() => {
     const capsule = capsuleRef.current;
     if (expanded || !onWidthChange || !capsule) return;
+    const windowsResize = diagnosticPlatform() === "windows";
+    let active = true;
     let lastWidth = 0;
     let lastPixelRatio = 0;
     const measure = () => {
+      if (!active) return;
       const width = Math.ceil(capsule.getBoundingClientRect().width);
-      const pixelRatio = window.devicePixelRatio;
+      const pixelRatio = windowsResize ? window.devicePixelRatio : 1;
       if (width <= 0 || (width === lastWidth && pixelRatio === lastPixelRatio)) return;
       lastWidth = width;
       lastPixelRatio = pixelRatio;
@@ -69,10 +73,11 @@ export function LanguageStatusCapsule({
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(capsule);
-    window.addEventListener("resize", measure);
+    if (windowsResize) window.addEventListener("resize", measure);
     return () => {
+      active = false;
       observer.disconnect();
-      window.removeEventListener("resize", measure);
+      if (windowsResize) window.removeEventListener("resize", measure);
     };
   }, [expanded, onWidthChange]);
 
