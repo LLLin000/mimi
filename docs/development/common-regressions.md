@@ -533,6 +533,9 @@ artifacts, and signing material.
   draft to profile/provider identity, preserve each translation route's key
   removal intent, retain fresh storage/session guards and release on finish.
   Process death reloads persisted configuration; it cannot restore RAM secrets.
+- For credential-free Android instrumentation, compare catalog files directly
+  when proving cancellation did not write. `SettingsStore.profiles()` can trigger
+  legacy credential migration or retirement; it is not a read-only precondition.
 
 - Before replacing the canonical development app, identify the source revision
   and any unpublished provider support in the running build. A stable signature

@@ -4,6 +4,47 @@
 实测范围和未解决项；条目是历史证据，后续任务仍须核对当前源码与设备。
 不写密钥、音频、字幕正文或个人目录，不把临时日志当作已持久归档的案例。
 
+## 2026-10-15：第四轮 pending 状态与 Android 虚拟机复核
+
+- 产品源码：`4793d51454d009149371fdec3ff6c31b40426fd6`，基于
+  `8a3c8de9`。设计见 [pending 状态边界](../plans/2026-10-15-pending-state-regressions.md)。
+  桌面三个名称字段离页后丢失失败草稿／重试，正式用户路径先 3 项失败，
+  修复后通过。补查串行保存、晚到结果、不同 route、删除失败／确认删除、
+  StrictMode 与中断 IME；后两项在修复审查时先复现，再补防护。
+- 录音收尾遇到目录、链接、损坏或内容不匹配的已有 WAV 时，旧逻辑会误报
+  成功并消费 PCM。两种来源与同文件头／长度但首字节、跨 buffer 尾字节
+  不同的用例均先失败；最终 16 项通过。仅复用已有输出时以两个 8 KiB
+  buffer 比较全 payload；异常保留 PCM／journal，合法旧输出与双源 retry
+  保留，已有保存记录及关闭保存的相邻测试通过。未访问真实用户记录。
+- 自定义 OpenAI ASR 的空／空白 completion 原先被丢弃，Stop 仍可能确认
+  已撤回草稿。共享 Rust 保留终结身份、只撤回匹配 owner，并在可靠撤回
+  交付时消费此前匹配的 queued draft。实际 localhost WebSocket → shared
+  client → controller 和 JNI engine 重放 4 种终稿 fixtures；另查旧空终稿／
+  新缺终稿 Stop tail。新增 3 个 owner 案例／12 steps 走 direct 与实际 JNI；
+  老显示 owner、新任务、连续撤回、晚到 preview、confirmed history、clear／
+  revision、deadline 与正常终稿均有聚焦回归，没有第二套 Kotlin 算法。
+- Android 15 的 `Mimi_Android15` 虚拟机保留既有开发数据，以相同 debug
+  签名 `install -r` 更新最终四 ABI APK。旧 editor 的真实 Activity 重建先
+  丢失草稿；修复后名称、识别字段、workspace／mode、Qwen 型号与独立 MT
+  route 的原始字段保留。取消不改变 catalog 哈希，fresh editor 无旧草稿，
+  凭据不进入 Bundle，密码保持遮罩。原生截图等标签动画结束后复核；测试
+  只使用未保存的合成 editor，不连接服务或启动采集。Process death 仍从
+  已保存配置加载，不恢复 RAM secrets。
+- macOS canonical 签名 watch 和内嵌前端的 UI-only 开发版验证添加、复制、
+  名称编辑后立即返回、不同 editor 隔离、校验离页保留与修正后保存。
+  后台 I/O 失败与迟到结果由受控异步回归覆盖，未在原生内存 fixture 注入
+  磁盘故障。提交后再次构建、严格签名校验并实际启动；构建／安装 Mach-O
+  UUID 一致，运行路径为 canonical 开发 app，随后正常退出。
+- 完整 `./scripts/check.sh` 通过：前端 2187 项、桌面 Rust 603 项；shared
+  runtime 785 项通过，既有需显式 native 环境的 ignored 项没有强行启用。
+  Android Debug／Release 各 234 项 JVM 测试通过，含生产 actual JNI；两种
+  lint 无错误，本次修改文件无 lint 诊断，debug APK 四 ABI／alignment／
+  notices 检查通过。peer 复核涵盖最终 owner／queue、WAV payload、IME 与
+  Android holder；之前选择器／voice 40 项和本地凭据正常 copy／delete／
+  restart 对照也通过。
+- 限制：没有真实 provider、音频采集、实体 Android 或 Windows／Linux
+  原生 UI 验收；合成输入不能证明真实识别质量、频率或阅读体验。没有发布版本。
+
 ## 2026-10-14：第三轮兼容性复核与选择／凭据边界
 
 - 基于 `0d2141a1`，设计见
