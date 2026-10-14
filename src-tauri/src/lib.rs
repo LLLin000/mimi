@@ -324,19 +324,31 @@ pub fn run() {
                     }
                     // Hiding instead of closing keeps the window alive so
                     // the tray or a repeated launch can restore it instantly.
-                    // Windows users may keep tray icons in the notification
-                    // overflow, so explicitly keep the native icon visible.
+                    // The tray is created visible. Windows' tray backend also
+                    // re-registers it on TaskbarCreated after Explorer restarts.
                     api.prevent_close();
                     let tray_ready = if let Some(tray) = app.tray_by_id("mimi-tray") {
-                        if let Err(error) = tray.set_visible(true) {
-                            tracing::warn!(
-                                error = %error,
-                                "settings close could not keep tray icon visible"
-                            );
-                            false
-                        } else {
+                        #[cfg(target_os = "windows")]
+                        {
+                            // Reapplying visibility calls Shell_NotifyIconW
+                            // synchronously on this UI thread. It is redundant
+                            // (we never hide the tray) and can wait on Explorer.
+                            let _ = tray;
                             record_ui_test_tray_visible();
                             true
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            if let Err(error) = tray.set_visible(true) {
+                                tracing::warn!(
+                                    error = %error,
+                                    "settings close could not keep tray icon visible"
+                                );
+                                false
+                            } else {
+                                record_ui_test_tray_visible();
+                                true
+                            }
                         }
                     } else {
                         tracing::warn!("settings close could not find tray icon");
