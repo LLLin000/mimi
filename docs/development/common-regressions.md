@@ -286,6 +286,26 @@ Keep unconfirmed resources out of all ready-language lists, invalidate earlier
 recognition results when resource work starts, and offer a read-only refresh.
 Do not reset TCC, change signing or delete system assets without evidence.
 
+## Windows process-loopback activation
+
+- A `VT_BLOB` activation `PROPVARIANT` borrows the completion handler's parameter
+  storage. Do not run `PropVariantClear` on it: that would `CoTaskMemFree` a
+  non-owning pointer and corrupt the heap. The handler must retain the payload
+  through asynchronous completion, including cancellation.
+- The activation callback and the explicitly initialized capture worker share
+  the process MTA. Transfer the owned audio interface within that apartment,
+  not through `AgileReference`: `IAudioClient` is a local interface, and an
+  unnecessary marshal can fail with `0x80040155`. Missing proxy registration is
+  not evidence of damaged Windows components. See Microsoft's
+  [process-loopback sample](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/ApplicationLoopback/cpp/LoopbackCapture.cpp)
+  and [MTA sharing contract](https://learn.microsoft.com/en-us/windows/win32/com/multithreaded-apartments).
+- Verify real output-device playback, selected-process capture and system mix
+  separately. Check visible recognized/translated subtitles, stop/restart and
+  process exit; a successful activation alone is not full-pipeline evidence.
+- `AppHangXProcB1` naming Explorer establishes an external wait, not its stack
+  or cause. Use bounded responsiveness probes and a hang dump when available;
+  do not infer a complete hang fix from a healthy short run or a screenshot.
+
 ## Overlay and UI checks
 
 For shared layout, notification choices and the cross-page review checklist,

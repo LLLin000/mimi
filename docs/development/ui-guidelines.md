@@ -76,6 +76,13 @@ These project rules apply to implementation and review.
   desktop reading edge. Growing reference text must not push an unchanged
   translation down; preserve complete glyph lines and deliberate history reading.
   Check changing line counts in native draws rather than only static screenshots.
+- Windows control-window measurements are CSS pixels, not native logical pixels.
+  Report the WebView's `devicePixelRatio` with capsule width and panel height,
+  and divide by the native window DPI scale before sizing against monitor bounds.
+  WebView `ZoomFactor` alone does not include the observed Windows text scaling.
+  Preserve accessibility scaling; size both fixed and measured dimensions in
+  the same units. Re-measure on viewport/DPI changes even when content width is
+  unchanged, and verify the actual native capsule and expanded panel.
 - Reserve readable label space and bound picker columns. Put ongoing device
   feedback in `SettingsRow.feedback`, below the label/control grid; never put a
   long status sentence beside a picker inside the auto-sized control column.
