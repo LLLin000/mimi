@@ -25,6 +25,49 @@ import kotlin.concurrent.thread
 
 /** Actual JNI checks use synthetic credentials; live transport fixtures stay on loopback. */
 class NativeRuntimeJniTest {
+    @Test fun qwenCompletionContractsPreventPartialConfirmationsAcrossActualJni() {
+        val cases = JSONObject(requireNotNull(javaClass.getResourceAsStream("/translation-contracts.json"))
+            .bufferedReader().use { it.readText() }).getJSONArray("qwenCompletionResponses")
+        for (index in 0 until cases.length()) {
+            val case = cases.getJSONObject(index)
+            val id = case.getString("id")
+            RealtimeLoopback(ServiceProvider.DASHSCOPE, case).use { fixture ->
+                val config = configuration().put("sourceLanguage", "en")
+                    .put("qwenMtModel", if (case.getBoolean("stream")) "lite" else "plus")
+                val handle = NativeRuntimeConfiguration.exchange(JSONObject().put("operation", "create")
+                    .put("configuration", config).put("network", fixture.network)).getLong("handle")
+                fun awaitState(predicate: (JSONObject) -> Boolean): JSONObject {
+                    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(8)
+                    while (System.nanoTime() < deadline) {
+                        fixture.checkFailure()
+                        val state = NativeRuntimeConfiguration.command("poll", handle)
+                        if (predicate(state)) return state
+                        Thread.sleep(10)
+                    }
+                    error("$id Qwen loopback state did not arrive")
+                }
+                try {
+                    NativeRuntimeConfiguration.command("start", handle)
+                    if (case.isNull("expected")) {
+                        val failed = awaitState { !it.isNull("errorCode") }
+                        assertEquals(id, "provider_error", failed.getString("errorCode"))
+                        assertEquals(id, 0, failed.getJSONObject("snapshot").getJSONArray("history").length())
+                        assertFalse(id, failed.getJSONObject("snapshot").getBoolean("displayPairFinal"))
+                        assertFalse(id, failed.toString().contains("synthetic-apiKey"))
+                    } else {
+                        val confirmed = awaitState { it.getJSONObject("snapshot").getJSONArray("history").length() == 1 }
+                        assertTrue(id, confirmed.isNull("errorCode"))
+                        val pair = confirmed.getJSONObject("snapshot").getJSONArray("history").getJSONObject(0)
+                        assertEquals(id, "Synthetic Qwen source.", pair.getString("source"))
+                        assertEquals(id, case.getString("expected"), pair.getString("translation"))
+                        NativeRuntimeConfiguration.command("finish", handle)
+                        awaitState { it.getBoolean("finished") }
+                    }
+                    fixture.checkFailure()
+                } finally { NativeRuntimeConfiguration.command("stop", handle) }
+            }
+        }
+    }
     @Test fun stopWatchdogIncludesNativeDrainDisconnectAndSnapshotPublication() {
         val policy = NativeRuntimeConfiguration.policy
         assertEquals(60L, policy.getLong("snapshotPublishIntervalMs"))
@@ -382,12 +425,14 @@ class NativeRuntimeJniTest {
     }
 
     /** CONNECT/TLS/WebSocket fixtures intercept the unchanged production endpoints on loopback. */
-    private class RealtimeLoopback(private val provider: ServiceProvider) : AutoCloseable {
+    private class RealtimeLoopback(private val provider: ServiceProvider, private val qwenResponse: JSONObject? = null) : AutoCloseable {
         private val tencent = provider == ServiceProvider.TENCENT
-        private val host = if (tencent) "asr.cloud.tencent.com" else "aip.baidubce.com"
+        private val qwen = provider == ServiceProvider.DASHSCOPE
+        private val host = if (qwen) "dashscope.aliyuncs.com" else if (tencent) "asr.cloud.tencent.com" else "aip.baidubce.com"
         private val phases = JSONObject(requireNotNull(javaClass.getResourceAsStream("/translation-contracts.json"))
             .bufferedReader().use { it.readText() }).let { contract ->
-            if (tencent) contract.getJSONObject("tencentSpeechTranslation").getJSONArray("jniReplayPhases")
+            if (qwen) JSONArray(listOf(JSONArray(listOf("""{"header":{"event":"result-generated"},"payload":{"output":{"sentence":{"sentence_id":1,"sentence_end":true,"text":"Synthetic Qwen source."}}}}"""))))
+            else if (tencent) contract.getJSONObject("tencentSpeechTranslation").getJSONArray("jniReplayPhases")
             else contract.getJSONObject("baiduRealtimeTranslation").getJSONArray("streams").let { streams ->
                 val frames = (0 until streams.length()).map(streams::getJSONObject)
                     .single { it.getString("id") == "final-with-following-draft" }.getJSONArray("frames")
@@ -396,12 +441,16 @@ class NativeRuntimeJniTest {
         }
         private val directory = Files.createTempDirectory("mimi-realtime-jni-").toFile()
         private val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        private val textServer = if (qwen) ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")) else null
         private val failure = AtomicReference<Throwable?>()
         private var socket: Socket? = null
+        private var textSocket: Socket? = null
+        @Volatile private var closed = false
         val nextMid = CountDownLatch(1)
         val nextFinal = CountDownLatch(1)
         val network: JSONObject
         private val worker: Thread
+        private val textWorker: Thread?
 
         init {
             // Generate a short-lived, synthetic server identity with the JDK used by Gradle.
@@ -418,8 +467,33 @@ class NativeRuntimeJniTest {
             val managers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply { init(store, password) }
             val tls = SSLContext.getInstance("TLS").apply { init(managers.keyManagers, null, null) }
             network = JSONObject().put("speechProxy", JSONObject().put("mode", "custom").put("url", "http://127.0.0.1:${server.localPort}"))
-                .put("textProxy", JSONObject().put("mode", "direct").put("url", JSONObject.NULL))
+                .put("textProxy", if (textServer == null) JSONObject().put("mode", "direct").put("url", JSONObject.NULL)
+                    else JSONObject().put("mode", "custom").put("url", "http://127.0.0.1:${textServer.localPort}"))
                 .put("trustRoots", JSONArray(listOf(Base64.getEncoder().encodeToString(store.getCertificate("fixture").encoded))))
+            textWorker = textServer?.let { listener -> thread(name = "mimi-qwen-text-loopback", isDaemon = true) {
+                try {
+                    while (!closed) {
+                        val tcp = listener.accept().also { textSocket = it; it.soTimeout = 5_000 }
+                        check(headers(DataInputStream(tcp.getInputStream())).startsWith("CONNECT $host:443 HTTP/1.1\r\n"))
+                        tcp.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                        val secure = (tls.socketFactory.createSocket(tcp, host, 443, true) as SSLSocket).apply { useClientMode = false; startHandshake() }
+                        textSocket = secure
+                        secure.use {
+                            val input = DataInputStream(secure.inputStream)
+                            val header = headers(input)
+                            check(header.startsWith("POST /compatible-mode/v1/chat/completions HTTP/1.1\r\n"))
+                            val length = header.lineSequence().first { it.startsWith("content-length:", true) }.substringAfter(':').trim().toInt()
+                            check(length in 1..65_536)
+                            val body = JSONObject(ByteArray(length).also(input::readFully).toString(Charsets.UTF_8))
+                            check(body.getBoolean("stream") == qwenResponse!!.getBoolean("stream"))
+                            val response = qwenResponse.getString("body").toByteArray(Charsets.UTF_8)
+                            secure.getOutputStream().write(("HTTP/1.1 200 OK\r\nContent-Length: ${response.size}\r\nConnection: close\r\n\r\n").toByteArray(Charsets.US_ASCII))
+                            secure.getOutputStream().write(response)
+                        }
+                        textSocket = null
+                    }
+                } catch (error: Throwable) { if (!closed) failure.set(error) }
+            } }
             worker = thread(name = "mimi-realtime-loopback", isDaemon = true) {
                 try {
                     server.soTimeout = 5_000
@@ -431,11 +505,14 @@ class NativeRuntimeJniTest {
                     val input = DataInputStream(secure.inputStream)
                     val output = secure.outputStream
                     val request = headers(input)
-                    check(request.startsWith(if (tencent) "GET /asr/speech_translate/123456789?" else "GET /ws/realtime_speech_trans HTTP/1.1\r\n"))
+                    check(request.startsWith(if (qwen) "GET /api-ws/v1/inference HTTP/1.1\r\n" else if (tencent) "GET /asr/speech_translate/123456789?" else "GET /ws/realtime_speech_trans HTTP/1.1\r\n"))
                     val key = request.lineSequence().first { it.startsWith("sec-websocket-key:", true) }.substringAfter(':').trim()
                     val accept = Base64.getEncoder().encodeToString(MessageDigest.getInstance("SHA-1").digest((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").toByteArray(Charsets.US_ASCII)))
                     output.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: $accept\r\n\r\n".toByteArray(Charsets.US_ASCII))
-                    if (tencent) send(output, """{"code":0}""") else {
+                    if (qwen) {
+                        check(JSONObject(readText(input, output)).getJSONObject("header").getString("action") == "run-task")
+                        send(output, """{"header":{"event":"task-started"}}""")
+                    } else if (tencent) send(output, """{"code":0}""") else {
                         val start = JSONObject(readText(input, output))
                         check(start.getString("type") == "START" && start.getString("app_key") == "synthetic-appKey")
                         check(start.getString("from") == "en" && start.getString("to") == "zh")
@@ -446,13 +523,21 @@ class NativeRuntimeJniTest {
                         repeat(frames.length()) { send(output, frames.getString(it)) }
                     }
                     phase(0)
-                    check(nextMid.await(10, TimeUnit.SECONDS))
-                    phase(1)
-                    check(nextFinal.await(10, TimeUnit.SECONDS))
-                    phase(2)
-                    check(JSONObject(readText(input, output)).getString("type") == if (tencent) "end" else "FINISH")
-                    send(output, if (tencent) """{"code":0,"final":1}""" else """{"code":0,"data":{"status":"END"}}""")
-                } catch (error: Throwable) { failure.set(error) }
+                    if (qwen) {
+                        val finish = readText(input, output)
+                        if (finish.isNotEmpty()) {
+                            check(JSONObject(finish).getJSONObject("header").getString("action") == "finish-task")
+                            send(output, """{"header":{"event":"task-finished"}}""")
+                        }
+                    } else {
+                        check(nextMid.await(10, TimeUnit.SECONDS))
+                        phase(1)
+                        check(nextFinal.await(10, TimeUnit.SECONDS))
+                        phase(2)
+                        check(JSONObject(readText(input, output)).getString("type") == if (tencent) "end" else "FINISH")
+                        send(output, if (tencent) """{"code":0,"final":1}""" else """{"code":0,"data":{"status":"END"}}""")
+                    }
+                } catch (error: Throwable) { if (!closed) failure.set(error) }
             }
         }
 
@@ -488,6 +573,8 @@ class NativeRuntimeJniTest {
                 val mask = ByteArray(4).also(input::readFully)
                 val payload = ByteArray(size).also(input::readFully)
                 for (index in payload.indices) payload[index] = (payload[index].toInt() xor mask[index % 4].toInt()).toByte()
+                if (qwen && opcode == 8) return ""
+                if (qwen && opcode == 2) continue
                 if (opcode == 9) frame(output, 10, payload) else {
                     check(opcode == 1) { "Unexpected loopback client frame" }
                     return payload.toString(Charsets.UTF_8)
@@ -495,9 +582,12 @@ class NativeRuntimeJniTest {
             }
         }
         override fun close() {
+            closed = true
             nextMid.countDown(); nextFinal.countDown()
-            socket?.close(); server.close()
+            socket?.close(); textSocket?.close(); server.close(); textServer?.close()
             worker.join(2_000)
+            textWorker?.join(2_000)
+            check(!worker.isAlive && textWorker?.isAlive != true) { "Synthetic realtime transport did not stop" }
             directory.deleteRecursively()
         }
     }

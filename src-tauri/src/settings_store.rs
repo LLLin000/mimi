@@ -305,6 +305,13 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    pub fn apply_windows_audio_source(&mut self, source: String) {
+        if self.windows_audio_source != source {
+            self.record_session_audio = false;
+        }
+        self.windows_audio_source = source;
+    }
+
     pub fn apply_system_audio_target(
         &mut self,
         target: crate::core::system_audio_target::SystemAudioTarget,
@@ -7128,6 +7135,58 @@ mod tests {
             restored.windows_audio_source,
             preferences.windows_audio_source
         );
+    }
+
+    #[test]
+    fn windows_source_changes_require_fresh_recording_opt_in_and_persist_it() {
+        for input in [AudioInput::System, AudioInput::Microphone, AudioInput::Both] {
+            for recording in [None, Some(false), Some(true)] {
+                let directory = tempfile::tempdir().unwrap();
+                let store = SettingsStore::at_path(
+                    directory.path().into(),
+                    Box::new(FakeSecretStore::default()),
+                );
+                store
+                    .save_preferences_for_active_profile(|prefs| {
+                        prefs.audio_input = input;
+                        prefs.windows_audio_source = "wasapi:synthetic-first".into();
+                        prefs.record_session_audio = true;
+                    })
+                    .unwrap();
+                store
+                    .save_preferences_for_active_profile(|prefs| {
+                        prefs.apply_audio_preferences(None, recording);
+                        prefs.apply_windows_audio_source("wasapi:synthetic-second".into());
+                    })
+                    .unwrap();
+                let changed = store.preferences();
+                assert_eq!(changed.audio_input, input);
+                assert_eq!(changed.windows_audio_source, "wasapi:synthetic-second");
+                assert!(!changed.record_session_audio);
+                let reloaded = SettingsStore::at_path(
+                    directory.path().into(),
+                    Box::new(FakeSecretStore::default()),
+                );
+                assert!(!reloaded.preferences().record_session_audio);
+                reloaded
+                    .save_preferences_for_active_profile(|prefs| {
+                        prefs.apply_audio_preferences(None, Some(true));
+                    })
+                    .unwrap();
+                reloaded
+                    .save_preferences_for_active_profile(|prefs| {
+                        prefs.apply_windows_audio_source("wasapi:synthetic-second".into());
+                    })
+                    .unwrap();
+                assert!(reloaded.preferences().record_session_audio);
+                reloaded
+                    .save_preferences_for_active_profile(|prefs| {
+                        prefs.apply_windows_audio_source(String::new());
+                    })
+                    .unwrap();
+                assert!(!reloaded.preferences().record_session_audio);
+            }
+        }
     }
 
     #[test]

@@ -101,6 +101,18 @@ describe("mergeSettingsSnapshot", () => {
     expect(changed).toMatchObject({ windowsAudioSource: "synthetic-render-endpoint", pulseStyle: "ribbon", pulseAnimation: false });
     expect(mergeSettingsSnapshot(changed, { fontSize: 20 }).windowsAudioSource).toBe("synthetic-render-endpoint");
   });
+  it("requires a fresh recording opt-in when the Windows source changes", () => {
+    for (const audioInput of ["system", "microphone", "both"] as const) {
+      for (const recordSessionAudio of [undefined, false, true]) {
+        const recording = { ...SETTINGS, audioInput, windowsAudioSource: "wasapi:synthetic-first", recordSessionAudio: true };
+        const changed = mergeSettingsSnapshot(recording, { windowsAudioSource: "wasapi:synthetic-second", recordSessionAudio });
+        expect(changed).toMatchObject({ audioInput, windowsAudioSource: "wasapi:synthetic-second", recordSessionAudio: false });
+        const optedIn = mergeSettingsSnapshot(changed, { recordSessionAudio: true });
+        expect(mergeSettingsSnapshot(optedIn, { windowsAudioSource: "wasapi:synthetic-second" }).recordSessionAudio).toBe(true);
+        expect(mergeSettingsSnapshot(optedIn, { windowsAudioSource: "" }).recordSessionAudio).toBe(false);
+      }
+    }
+  });
   it("merges runtime-safe subtitle presentation preferences", () => {
     expect(
       mergeSettingsSnapshot(SETTINGS, {

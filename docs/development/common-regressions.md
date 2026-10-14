@@ -47,7 +47,11 @@ Rules:
   frontend builds in one checkout. They write the same `dist` directory even
   when Cargo target directories differ. Concurrent writes can remove a CSS or
   JavaScript asset while Tauri embeds it; finish the first build before retrying
-  the second, without clearing shared caches.
+  the second, without clearing shared caches. Finish the native UI inspection,
+  quit its app and stop `dev-app.sh --watch` before the complete `check.sh`:
+  its real watch-server regression also binds port 1420 and correctly fails if
+  that preview is still running. Do not change the configured port or clear
+  caches to bypass this collision.
 - Focused Rust checks use the same local registry as `check.sh`: set
   `CARGO_HOME="${CARGO_HOME:-$PWD/.cargo-home}"` before `cargo test` or Clippy.
   A bare Cargo invocation can switch registry source paths and rebuild otherwise

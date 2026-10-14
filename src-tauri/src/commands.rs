@@ -1896,6 +1896,10 @@ fn apply_settings_draft_guarded(
         .system_audio_target
         .as_ref()
         .is_some_and(|target| *target != state.settings.preferences().system_audio_target);
+    let windows_source_changed = draft
+        .windows_audio_source
+        .as_ref()
+        .is_some_and(|source| *source != previous_preferences.windows_audio_source);
     let save_preferences = || {
         state.settings.save_preferences_for_active_profile(|prefs| {
             if let Some(proxy) = &network_proxy {
@@ -1913,10 +1917,10 @@ fn apply_settings_draft_guarded(
             if let Some(enabled) = draft.retain_session_history {
                 prefs.retain_session_history = enabled;
             }
-            if let Some(source) = draft.windows_audio_source {
-                prefs.windows_audio_source = source;
-            }
             prefs.apply_audio_preferences(draft.audio_input, draft.record_session_audio);
+            if let Some(source) = draft.windows_audio_source {
+                prefs.apply_windows_audio_source(source);
+            }
             if let Some(opacity) = draft.subtitle_background_opacity {
                 prefs.subtitle_background_opacity = opacity;
             }
@@ -1991,9 +1995,11 @@ fn apply_settings_draft_guarded(
     sync_overlay_minimum(app);
     // Source changes can clear recording even when the draft omits it. Use
     // the saved value so a combined draft cannot retain old-source audio.
-    let recording =
-        (target_changed || draft.audio_input.is_some() || draft.record_session_audio.is_some())
-            .then(|| state.settings.preferences().record_session_audio);
+    let recording = (target_changed
+        || windows_source_changed
+        || draft.audio_input.is_some()
+        || draft.record_session_audio.is_some())
+    .then(|| state.settings.preferences().record_session_audio);
     state
         .session
         .apply_archive_opt_out(draft.retain_session_history, recording);

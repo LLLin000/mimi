@@ -184,6 +184,10 @@ export function mergeSettingsSnapshot(
 ): SettingsSnapshot {
   const networkProxy = draft.networkProxy === undefined ? null
     : validateNetworkProxy(draft.networkProxy.mode, draft.networkProxy.url);
+  const recordingInputChanged =
+    (draft.systemAudioTarget !== undefined && JSON.stringify(draft.systemAudioTarget) !== JSON.stringify(current.systemAudioTarget ?? { kind: "system" }))
+    || (draft.audioInput !== undefined && draft.audioInput !== (current.audioInput ?? "system"))
+    || (draft.windowsAudioSource !== undefined && draft.windowsAudioSource !== (current.windowsAudioSource ?? ""));
   return {
     ...current,
     sourceLanguage: draft.sourceLanguage ?? current.sourceLanguage,
@@ -216,7 +220,7 @@ export function mergeSettingsSnapshot(
     retainSessionHistory:
       draft.retainSessionHistory ?? current.retainSessionHistory,
     // A prior recording opt-in must never silently cover a different input.
-    recordSessionAudio: (draft.systemAudioTarget !== undefined && JSON.stringify(draft.systemAudioTarget) !== JSON.stringify(current.systemAudioTarget ?? { kind: "system" })) || (draft.audioInput !== undefined && draft.audioInput !== (current.audioInput ?? "system"))
+    recordSessionAudio: recordingInputChanged
       ? false : draft.recordSessionAudio ?? current.recordSessionAudio,
   };
 }
