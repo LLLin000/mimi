@@ -1223,6 +1223,83 @@ mod tests {
     }
 
     #[test]
+    fn source_observation_contracts_keep_complete_pairs_through_provider_decoding() {
+        use mimi_core::live_pair_aligner::{LivePairAligner, LivePairEvent};
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../../live-pair-contracts.json")).unwrap();
+        let ids = [
+            "late_previous_source_final_preserves_new_pending_final",
+            "legacy_next_translation_waits_for_unobserved_source_after_retirement",
+            "legacy_empty_source_final_does_not_move_current_back",
+            "legacy_translation_placeholder_before_current_waits_for_actual_source",
+        ];
+        let mut checked = 0;
+        for case in fixtures["cases"].as_array().unwrap() {
+            if !ids.contains(&case["id"].as_str().unwrap()) {
+                continue;
+            }
+            checked += 1;
+            let mut aligner = LiveTranslatePairAligner::default();
+            let epoch = Instant::now();
+            for (index, step) in case["steps"].as_array().unwrap().iter().enumerate() {
+                if step["legacySourceOrder"] == true {
+                    let mut state = serde_json::to_value(&aligner.core).unwrap();
+                    state.as_object_mut().unwrap().remove("source_order");
+                    aligner.core = serde_json::from_value::<LivePairAligner>(state).unwrap();
+                    continue;
+                }
+                let (event, identity) =
+                    LiveTranslateServerEvent::decode_value_with_identity(&step["providerFrame"])
+                        .unwrap();
+                let output = aligner.observe_at(
+                    &event,
+                    &identity,
+                    epoch + Duration::from_nanos(step["atNs"].as_u64().unwrap()),
+                );
+                let expected: Vec<_> = step["expected"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|event| {
+                        match serde_json::from_value::<LivePairEvent>(event.clone()).unwrap() {
+                            LivePairEvent::UtteranceText {
+                                utterance_id,
+                                role,
+                                text,
+                                is_final,
+                                language,
+                            } => LiveTranslateServerEvent::UtteranceText {
+                                utterance_id,
+                                role,
+                                text,
+                                is_final,
+                                language,
+                            },
+                            LivePairEvent::FinalPair {
+                                utterance_id,
+                                source,
+                                translation,
+                                language,
+                                ..
+                            } => LiveTranslateServerEvent::SubtitleIdentifiedFinalPair {
+                                utterance_id,
+                                source,
+                                translation,
+                                language,
+                            },
+                            other => {
+                                panic!("unexpected source-observation fixture output: {other:?}")
+                            }
+                        }
+                    })
+                    .collect();
+                assert_eq!(output, expected, "{} step {index}", case["id"]);
+            }
+        }
+        assert_eq!(checked, ids.len());
+    }
+
+    #[test]
     fn a_recognition_final_waits_for_its_own_translation_final() {
         let mut aligner = LiveTranslatePairAligner::default();
         aligner.observe(

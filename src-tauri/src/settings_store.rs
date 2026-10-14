@@ -1075,7 +1075,7 @@ impl SettingsStore {
     }
 
     #[cfg(test)]
-    fn at_path(app_config_dir: PathBuf, secret: Box<dyn SecretStore>) -> Self {
+    pub(crate) fn at_path(app_config_dir: PathBuf, secret: Box<dyn SecretStore>) -> Self {
         // Existing provider/storage regressions exercise an explicitly configured
         // installation. First-run tests call load_with_secret without this fixture.
         if !app_config_dir.join(PROFILE_CATALOG_FILE).exists()
@@ -1185,13 +1185,6 @@ impl SettingsStore {
             catalog.active_profile_id.clone(),
             catalog.profiles.clone(),
         ))
-    }
-
-    /// Safe fallback used only for best-effort broadcasts after the initial
-    /// `settings_get` has already reported a catalog error.
-    pub fn profile_catalog_or_default(&self) -> (String, Vec<ServiceProfile>) {
-        let catalog = self.catalog.lock().unwrap();
-        (catalog.active_profile_id.clone(), catalog.profiles.clone())
     }
 
     pub fn active_profile(&self) -> Result<ServiceProfile, String> {
@@ -8333,7 +8326,7 @@ mod tests {
         store.secret_cache.lock().unwrap().clear();
         fake.state.lock().unwrap().loads.clear();
         store.select_profile(&profile.id).unwrap();
-        let snapshot = crate::commands::SettingsSnapshotPayload::from_store(&store);
+        let snapshot = crate::commands::SettingsSnapshotPayload::try_from_store(&store).unwrap();
         let payload = snapshot
             .profiles
             .iter()
@@ -8762,7 +8755,7 @@ mod tests {
                 .saved_fields
                 .is_empty());
             let snapshot = serde_json::to_string(
-                &crate::commands::SettingsSnapshotPayload::from_store(&store),
+                &crate::commands::SettingsSnapshotPayload::try_from_store(&store).unwrap(),
             )
             .unwrap();
             for private in [
@@ -8930,7 +8923,7 @@ mod tests {
             Some("https://example.com/private-path/translate")
         );
         let snapshot = serde_json::to_string(
-            &crate::commands::SettingsSnapshotPayload::from_store(&store),
+            &crate::commands::SettingsSnapshotPayload::try_from_store(&store).unwrap(),
         )
         .unwrap();
         assert!(!snapshot.contains("private-path"));
@@ -11473,7 +11466,8 @@ mod tests {
             assert_eq!(reloaded.preferences().show_subtitle_timestamps, enabled);
             assert_eq!(reloaded.configuration().unwrap(), original_configuration);
             assert_eq!(
-                crate::commands::SettingsSnapshotPayload::from_store(&reloaded)
+                crate::commands::SettingsSnapshotPayload::try_from_store(&reloaded)
+                    .unwrap()
                     .show_subtitle_timestamps,
                 enabled
             );
@@ -11729,14 +11723,10 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             r#"{"schemaVersion":99,"profiles":[]}"#
         );
-        let fallback = crate::commands::SettingsSnapshotPayload::from_store(&store);
-        assert!(fallback
-            .profiles
-            .iter()
-            .all(|profile| profile.credential_state == CredentialState::Unavailable));
-        let fallback_json = serde_json::to_value(fallback).unwrap();
-        assert!(fallback_json.get("error").is_none());
-        assert!(fallback_json.get("credentialError").is_none());
+        assert_eq!(
+            crate::commands::SettingsSnapshotPayload::try_from_store(&store).unwrap_err(),
+            PROFILE_CATALOG_UNAVAILABLE
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }

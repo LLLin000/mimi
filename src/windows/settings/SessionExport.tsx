@@ -55,7 +55,7 @@ export function SessionExport({ visible }: { visible: boolean }) {
   const historyRequest = useRef(0);
   const audioRequest = useRef(0);
   const interaction = useRef(0);
-  const visibility = useRef(0);
+  const selectedHistoryId = useRef<string | null>(null);
 
   const selected = history.find((item) => item.id === selectedId);
   const audioSources = selected ? selected.audioSources ?? ["system" as const] : archive?.audioSources ?? ["system" as const];
@@ -64,10 +64,12 @@ export function SessionExport({ visible }: { visible: boolean }) {
   const displayedTranscript = availableCount ? transcript : undefined;
 
   function selectHistory(id: string | null) {
-    if (id === selectedId) return;
+    if (id === selectedHistoryId.current) return;
+    selectedHistoryId.current = id;
     interaction.current += 1;
     clearToast();
     setHistoryError(false);
+    transcriptRequest.current += 1;
     audioRequest.current += 1;
     setAudioUrl(null);
     setAudioError(false);
@@ -115,7 +117,6 @@ export function SessionExport({ visible }: { visible: boolean }) {
 
   useEffect(() => {
     interaction.current += 1;
-    visibility.current += 1;
   }, [visible]);
 
   useEffect(() => {
@@ -191,16 +192,18 @@ export function SessionExport({ visible }: { visible: boolean }) {
     if (!isTauri || operation.current) return;
     const currentLifetime = lifetime.current;
     const currentInteraction = interaction.current;
-    const currentVisibility = visibility.current;
     operation.current = true;
     setBusy(true);
     setHistoryError(false);
     const notify = beginToast();
     try {
       await sessionHistoryDelete(id);
-      if (lifetime.current !== currentLifetime || visibility.current !== currentVisibility) return;
+      if (lifetime.current !== currentLifetime) return;
+      // Deletion changes the catalog even after navigation. Reject an older
+      // list snapshot without disturbing another selected session's content.
+      historyRequest.current += 1;
       setHistory((items) => items.filter((item) => item.id !== id));
-      if (interaction.current === currentInteraction) selectHistory(null);
+      if (selectedHistoryId.current === id) selectHistory(null);
     } catch {
       if (lifetime.current === currentLifetime && interaction.current === currentInteraction) {
         notify(I18N.settings.historyDeleteFailed, true);

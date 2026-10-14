@@ -121,16 +121,95 @@ describe("history operation state", () => {
     expect(host.textContent).not.toContain(I18N.settings.historyDeleteFailed);
     expect(host.textContent).not.toContain(I18N.settings.sessionExportFailed);
   });
-  it("does not reset selection after closing and reopening during deletion", async () => {
+  it("removes a deleted selection after leaving and returning during deletion", async () => {
     const pending = deferred(); await select(1); await confirm(); ipc.sessionHistoryDelete.mockReturnValueOnce(pending.promise);
     await click(button(I18N.settings.historyDelete));
     await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
     expect(document.querySelector(".settings-confirmation")).toBeNull();
     await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
     await act(async () => pending.resolve()); await flush();
-    expect(host.querySelector(".is-selected")).not.toBeNull();
+    expect(host.querySelectorAll(".session-history__item")).toHaveLength(2);
+    expect(host.querySelector(".is-selected")?.textContent).toContain(I18N.settings.historyCurrent);
+    expect(host.textContent).not.toContain("Synthetic A");
+    expect(host.textContent).toContain("Synthetic current");
+    expect(host.querySelector(".settings-toast")).toBeNull();
+  });
+  it("does not restore a deleted session from a list captured before deletion finished", async () => {
+    const deletion = deferred(); const listing = deferred();
+    await select(1); await confirm(); ipc.sessionHistoryDelete.mockReturnValueOnce(deletion.promise);
+    await click(button(I18N.settings.historyDelete));
+    await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+    ipc.sessionHistoryList.mockReturnValueOnce(listing.promise);
+    await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+    await act(async () => deletion.resolve()); await flush();
+    await act(async () => listing.resolve(["A", "B"].map((id, n) => ({ id, count: 61, hasAudio: false, startedAtMs: 1_700_000_000_000 + n * 3600000 }))));
+    await flush();
+    expect(host.querySelectorAll(".session-history__item")).toHaveLength(2);
+    expect(host.textContent).not.toContain("Synthetic A");
+    await select(1);
+    expect(ipc.sessionHistoryPage).toHaveBeenLastCalledWith("B", "", 0);
+  });
+  it("discards pending transcript and playback for the deleted selection", async () => {
+    const objectUrl = vi.fn(() => "blob:synthetic-A");
+    vi.stubGlobal("URL", Object.assign(class extends URL {}, { createObjectURL: objectUrl, revokeObjectURL: vi.fn() }));
+    try {
+      ipc.sessionHistoryList.mockResolvedValue(["A", "B"].map((id, n) => ({ id, count: 61, hasAudio: true, startedAtMs: 1_700_000_000_000 + n * 3600000 })));
+      await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+      await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+      const transcript = deferred(); const playback = deferred(); const deletion = deferred(); const currentRead = deferred();
+      ipc.sessionHistoryPage.mockReturnValueOnce(transcript.promise);
+      await select(1);
+      ipc.sessionHistoryAudio.mockReturnValueOnce(playback.promise);
+      await click(button(I18N.settings.historyPlayAudio));
+      await confirm(); ipc.sessionHistoryDelete.mockReturnValueOnce(deletion.promise);
+      await click(button(I18N.settings.historyDelete));
+      ipc.sessionTranscriptPage.mockReturnValueOnce(currentRead.promise);
+      await act(async () => {
+        deletion.resolve();
+        transcript.resolve(page("A"));
+        playback.resolve(new ArrayBuffer(4));
+      });
+      await flush();
+      expect(host.textContent).not.toContain("Synthetic A");
+      expect(host.querySelector("audio")).toBeNull();
+      expect(objectUrl).not.toHaveBeenCalled();
+      await act(async () => currentRead.resolve(page("current")));
+      expect(host.textContent).toContain("Synthetic current");
+    } finally { await act(() => root.render(null)); vi.unstubAllGlobals(); }
+  });
+  it.each([false, true])("preserves B's recording when deletion finishes after navigation (playback pending: %s)", async (playbackPending) => {
+    const objectUrl = vi.fn(() => "blob:synthetic-B");
+    const revokeObjectUrl = vi.fn();
+    vi.stubGlobal("URL", Object.assign(class extends URL {}, { createObjectURL: objectUrl, revokeObjectURL: revokeObjectUrl }));
+    try {
+      ipc.sessionHistoryList.mockResolvedValue(["A", "B"].map((id, n) => ({ id, count: 61, hasAudio: true, startedAtMs: 1_700_000_000_000 + n * 3600000 })));
+      await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+      await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+      const deletion = deferred(); const playback = deferred();
+      await select(1); await confirm(); ipc.sessionHistoryDelete.mockReturnValueOnce(deletion.promise);
+      await click(button(I18N.settings.historyDelete)); await click(button(I18N.settings.cancel)); await select(2);
+      ipc.sessionHistoryAudio.mockReturnValueOnce(playbackPending ? playback.promise : Promise.resolve(new ArrayBuffer(4)));
+      await click(button(I18N.settings.historyPlayAudio));
+      await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+      await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+      await act(async () => deletion.resolve()); await flush();
+      if (playbackPending) await act(async () => playback.resolve(new ArrayBuffer(4)));
+      expect(host.querySelectorAll(".session-history__item")).toHaveLength(2);
+      expect(host.textContent).toContain("Synthetic B");
+      expect(host.querySelector("audio")?.src).toBe("blob:synthetic-B");
+      expect(revokeObjectUrl).not.toHaveBeenCalled();
+      expect(host.querySelector(".settings-toast")).toBeNull();
+    } finally { await act(() => root.render(null)); vi.unstubAllGlobals(); }
+  });
+  it("keeps the reopened selection and suppresses stale feedback when deletion fails", async () => {
+    const deletion = deferred(); await select(1); await confirm(); ipc.sessionHistoryDelete.mockReturnValueOnce(deletion.promise);
+    await click(button(I18N.settings.historyDelete));
+    await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+    await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+    await act(async () => deletion.reject(new Error("synthetic deletion failure"))); await flush();
+    expect(host.querySelectorAll(".session-history__item")).toHaveLength(3);
     expect(host.textContent).toContain("Synthetic A");
-    expect(host.textContent).not.toContain("Synthetic current");
+    expect(host.querySelector(".settings-toast")).toBeNull();
   });
   it("retains transcript after clear failure, then hides content after successful clear", async () => {
     ipc.sessionArchiveClear.mockRejectedValueOnce(new Error("fixture"));

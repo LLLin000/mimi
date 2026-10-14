@@ -103,6 +103,7 @@ impl ServiceProfilePayload {
         }
     }
 
+    #[cfg(test)]
     fn unavailable(profile: ServiceProfile) -> Self {
         let text_translation = profile.text_translation();
         Self {
@@ -254,6 +255,65 @@ pub struct SettingsSnapshotPayload {
 mod tests {
     use super::*;
     use crate::apple_speech::AppleSpeechResourceStatus;
+
+    #[tokio::test]
+    async fn initial_settings_load_preserves_empty_and_unavailable_credential_catalogs() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("service-profiles.json"),
+            r#"{"schemaVersion":1,"activeProfileId":"","profiles":[]}"#,
+        )
+        .unwrap();
+        let empty = SettingsStore::at_path(
+            directory.path().into(),
+            Box::new(PartiallyUnavailableSecretStore),
+        );
+        let snapshot = load_settings_snapshot(&empty, true).await.unwrap();
+        assert!(snapshot.profiles.is_empty());
+        assert!(snapshot.active_profile_id.is_empty());
+
+        let unavailable =
+            SettingsStore::in_memory(Box::new(PartiallyUnavailableSecretStore), false);
+        let snapshot = load_settings_snapshot(&unavailable, true).await.unwrap();
+        assert_eq!(snapshot.profiles.len(), 1);
+        assert_eq!(
+            snapshot.profiles[0].credential_state,
+            CredentialState::Unavailable
+        );
+        assert!(snapshot.language_capabilities.is_some());
+    }
+
+    #[tokio::test]
+    async fn initial_settings_load_rejects_an_unreadable_catalog_without_empty_success() {
+        for content in [
+            "{invalid catalog",
+            r#"{"schemaVersion":999,"activeProfileId":"","profiles":[]}"#,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("service-profiles.json");
+            std::fs::write(&path, content).unwrap();
+            let store = SettingsStore::at_path(
+                directory.path().into(),
+                Box::new(PartiallyUnavailableSecretStore),
+            );
+            let result = load_settings_snapshot(&store, true).await;
+            assert_eq!(
+                result.unwrap_err(),
+                "Service profile settings are unavailable."
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("service-profiles.json")).unwrap();
+        let store = SettingsStore::at_path(
+            directory.path().into(),
+            Box::new(PartiallyUnavailableSecretStore),
+        );
+        assert_eq!(
+            load_settings_snapshot(&store, true).await.unwrap_err(),
+            "Service profile settings are unavailable."
+        );
+    }
 
     #[test]
     fn profile_snapshots_keep_speech_names_when_credentials_are_unavailable() {
@@ -1314,55 +1374,6 @@ mod tests {
 }
 
 impl SettingsSnapshotPayload {
-    pub fn from_store(store: &SettingsStore) -> Self {
-        match Self::try_from_store(store) {
-            Ok(payload) => payload,
-            Err(_) => {
-                let prefs = store.preferences();
-                let (active_profile_id, profiles) = store.profile_catalog_or_default();
-                Self {
-                    credential_storage: store.credential_storage(),
-                    profiles: profiles
-                        .into_iter()
-                        .map(ServiceProfilePayload::unavailable)
-                        .collect(),
-                    active_profile_id,
-                    language_capabilities: None,
-                    source_language: prefs.source_language,
-                    target_language: prefs.target_language,
-                    translation_mode: prefs.translation_mode,
-                    font_size: prefs.font_size,
-                    subtitle_font_family: prefs.subtitle_font_family,
-                    subtitle_background_opacity: prefs.subtitle_background_opacity,
-                    subtitle_color: prefs.subtitle_color,
-                    microphone_subtitle_color: prefs.microphone_subtitle_color,
-                    subtitle_alignment: prefs.subtitle_alignment,
-                    subtitle_display_mode: prefs.subtitle_display_mode,
-                    show_intermediate_subtitles: prefs.show_intermediate_subtitles,
-                    show_subtitle_dividers: prefs.show_subtitle_dividers,
-                    show_subtitle_timestamps: prefs.show_subtitle_timestamps,
-
-                    pulse_animation: prefs.pulse_animation,
-                    pulse_style: prefs.pulse_style,
-
-                    subtitle_animation: prefs.subtitle_animation,
-                    subtitle_blends_with_background: prefs.subtitle_blends_with_background,
-                    is_overlay_locked: prefs.overlay_locked,
-                    ui_language: prefs.ui_language,
-                    retain_session_history: prefs.retain_session_history,
-                    record_session_audio: prefs.record_session_audio,
-                    audio_input: prefs.audio_input,
-                    microphone_input_available:
-                        crate::core::audio_input::MICROPHONE_INPUT_AVAILABLE,
-                    windows_audio_source: prefs.windows_audio_source,
-                    system_audio_target: prefs.system_audio_target,
-                    show_in_dock: prefs.show_in_dock,
-                    network_proxy: prefs.network_proxy,
-                }
-            }
-        }
-    }
-
     pub fn try_from_store(store: &SettingsStore) -> Result<Self, String> {
         let (prefs, active_profile_id, profiles) = store.preferences_and_catalog()?;
         let language_capabilities = profiles
@@ -1448,10 +1459,16 @@ pub struct SettingsDraft {
 /// main-thread path.
 #[tauri::command]
 pub async fn settings_get(state: State<'_, AppState>) -> Result<SettingsSnapshotPayload, String> {
-    if !app_is_ui_test()
+    load_settings_snapshot(&state.settings, app_is_ui_test()).await
+}
+
+async fn load_settings_snapshot(
+    settings: &SettingsStore,
+    is_ui_test: bool,
+) -> Result<SettingsSnapshotPayload, String> {
+    if !is_ui_test
         && !crate::apple_speech_support::is_loaded()
-        && state
-            .settings
+        && settings
             .active_profile()
             .is_ok_and(|profile| profile.provider == ProviderKind::AppleSpeech)
     {
@@ -1459,16 +1476,15 @@ pub async fn settings_get(state: State<'_, AppState>) -> Result<SettingsSnapshot
         // Failure leaves an empty language list and is surfaced by its editor.
         let _ = crate::apple_speech_support::refresh().await;
     }
-    if !app_is_ui_test()
+    if !is_ui_test
         && !crate::apple_translation_support::is_loaded()
-        && state
-            .settings
+        && settings
             .active_profile()
             .is_ok_and(|profile| profile.text_translation() == TextTranslation::Apple)
     {
         let _ = crate::apple_translation_support::refresh().await;
     }
-    Ok(SettingsSnapshotPayload::from_store(&state.settings))
+    SettingsSnapshotPayload::try_from_store(settings)
 }
 
 #[tauri::command]
@@ -2493,10 +2509,9 @@ pub fn overlay_set_locked(
         locked || preferences.subtitle_blends_with_background,
         preferences.subtitle_blends_with_background,
     );
-    let _ = app.emit(
-        "settings-changed",
-        SettingsSnapshotPayload::from_store(&state.settings),
-    );
+    // A successful overlay preference write must not turn an unreadable
+    // service catalog into an apparently valid empty settings snapshot.
+    let _ = emit_settings_snapshot(&app, &state.settings);
     Ok(())
 }
 

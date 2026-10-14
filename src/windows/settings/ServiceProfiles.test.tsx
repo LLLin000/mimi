@@ -584,7 +584,7 @@ it.each(["zh", "en", "ja"] as const)("omits normal credential status and keeps a
   }
 });
 
-it("shows loading or a retryable initialization timeout without claiming credentials are unavailable", async () => {
+it.each(["timeout", "unavailable"] as const)("shows loading or a retryable %s without claiming a fresh install", async error => {
   const empty = { ...settings, profiles: [], activeProfileId: "" };
   boot.initializationStatus = "loading";
   await render(empty);
@@ -592,9 +592,9 @@ it("shows loading or a retryable initialization timeout without claiming credent
   expect(host.textContent).not.toContain(I18N.settings.credentialUnavailable);
   expect(host.textContent).not.toContain(I18N.settings.firstProfileTitle);
   expect(host.querySelector(".service-rows")).toBeNull();
-  boot.initializationStatus = "error"; boot.initializationError = "timeout";
+  boot.initializationStatus = "error"; boot.initializationError = error;
   await render(empty);
-  expect(host.textContent).toContain(I18N.settings.settingsSnapshotTimeout);
+  expect(host.textContent).toContain(error === "timeout" ? I18N.settings.settingsSnapshotTimeout : I18N.settings.settingsSnapshotFailed);
   expect(host.textContent).not.toContain(I18N.settings.firstProfileTitle);
   await click(I18N.settings.retryLoadingSettings);
   expect(boot.init).toHaveBeenCalledOnce();

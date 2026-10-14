@@ -750,6 +750,29 @@ struct LocalCaptureStats {
     sample_rate: u32,
 }
 
+fn finalize_pending_history(
+    history: &SessionHistory,
+    id: &str,
+    ended_at_ms: u64,
+    limited: bool,
+    retain_text: bool,
+    retain_audio: bool,
+) -> std::io::Result<bool> {
+    // An opt-out takes effect even when its initial filesystem cleanup fails.
+    // Retry that cleanup before making any current content saved history.
+    if !retain_text && !retain_audio {
+        history.discard(id)?;
+        return Ok(false);
+    }
+    if !retain_text {
+        history.clear_text(id)?;
+    }
+    if !retain_audio {
+        history.clear_audio(id)?;
+    }
+    history.finalize(id, ended_at_ms, limited)
+}
+
 /// Capture presentation never borrows a retired generation's recent activity.
 /// Unlike diagnostics, this represents currently selected live input only.
 fn source_capture_observation(
@@ -3011,6 +3034,7 @@ impl SessionManager {
             .lock()
             .unwrap()
             .as_deref()
+            .filter(|_| self.history_pending_audio.load(Ordering::SeqCst))
             .and_then(|id| self.history.audio_sources(id).ok())
             .unwrap_or_default();
         let stats = self.history_stats.lock().unwrap();
@@ -3056,10 +3080,14 @@ impl SessionManager {
             return Ok(());
         }
         let limited = self.history_stats.lock().unwrap().transcript_limited;
-        if let Err(error) =
-            self.history
-                .finalize(id, crate::core::subtitle_reducer::now_epoch_ms(), limited)
-        {
+        if let Err(error) = finalize_pending_history(
+            &self.history,
+            id,
+            crate::core::subtitle_reducer::now_epoch_ms(),
+            limited,
+            self.history_pending_text.load(Ordering::SeqCst),
+            self.history_pending_audio.load(Ordering::SeqCst),
+        ) {
             self.history_save_error.store(true, Ordering::SeqCst);
             return Err(error);
         }
@@ -3080,7 +3108,10 @@ impl SessionManager {
             return Ok(self.controller.lock().unwrap().archive().page(query, page));
         }
         let pending = self.history_pending_id.lock().unwrap();
-        let Some(id) = pending.as_deref() else {
+        let Some(id) = pending
+            .as_deref()
+            .filter(|_| self.history_pending_text.load(Ordering::SeqCst))
+        else {
             return Ok(crate::core::session_archive::TranscriptPage {
                 total: 0,
                 page: 0,
@@ -3101,7 +3132,10 @@ impl SessionManager {
                 .map(String::into_bytes));
         }
         let pending = self.history_pending_id.lock().unwrap();
-        match pending.as_deref() {
+        match pending
+            .as_deref()
+            .filter(|_| self.history_pending_text.load(Ordering::SeqCst))
+        {
             Some(id) => self.history.export_transcript(id).map(Some),
             None => Ok(None),
         }
@@ -3134,7 +3168,10 @@ impl SessionManager {
             return Ok(index.and_then(|index| recordings[index].export()));
         }
         let pending = self.history_pending_id.lock().unwrap();
-        match pending.as_deref() {
+        match pending
+            .as_deref()
+            .filter(|_| self.history_pending_audio.load(Ordering::SeqCst))
+        {
             Some(id) => self.history.audio_selected(id, source).map(Some),
             None => Ok(None),
         }
@@ -4586,10 +4623,11 @@ impl SessionManager {
     /// window re-shows in case its webview missed events while hidden).
     pub fn publish_settings(&self) {
         crate::commands::sync_overlay_minimum(&self.app);
-        let _ = self.app.emit(
-            "settings-changed",
-            crate::commands::SettingsSnapshotPayload::from_store(&self.settings),
-        );
+        if let Ok(payload) =
+            crate::commands::SettingsSnapshotPayload::try_from_store(&self.settings)
+        {
+            let _ = self.app.emit("settings-changed", payload);
+        }
     }
 
     fn is_ui_test(&self) -> bool {
@@ -4733,6 +4771,121 @@ fn seed_ui_test_live_subtitles(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    fn verify_failed_opt_out_cleanup_is_retried(retain_text: bool, retain_audio: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().to_path_buf(), false);
+        let pair = |source| {
+            let mut pair = crate::core::models::SubtitlePair::new(
+                "Synthetic retained source".into(),
+                "Synthetic retained translation".into(),
+                100,
+            );
+            pair.audio_source = source;
+            pair
+        };
+        let saved_id = uuid::Uuid::new_v4().to_string();
+        let pending_id = uuid::Uuid::new_v4().to_string();
+        for id in [&saved_id, &pending_id] {
+            history.begin(id, 0).unwrap();
+            for source in [AudioSource::System, AudioSource::Microphone] {
+                history.append_pair(id, &pair(source)).unwrap();
+                history
+                    .append_pcm_from(id, source, 16_000, &[1, 0, 2, 0])
+                    .unwrap();
+            }
+        }
+        history.finalize(&saved_id, 200, false).unwrap();
+        let saved_transcript = history.export_transcript(&saved_id).unwrap();
+        let saved_audio = history
+            .audio_from(&saved_id, AudioSource::Microphone)
+            .unwrap();
+
+        // A provider error ends listening but leaves the current journal for
+        // the user's subsequent opt-out, restart or normal quit.
+        let mut controller = TranslationSessionController::default();
+        controller.did_connect();
+        controller.did_fail("synthetic provider error");
+        assert!(!controller.state.status.is_active());
+
+        let blocked_path = directory.path().join(format!(
+            "{pending_id}.{}",
+            if retain_text { "pcm" } else { "jsonl" }
+        ));
+        let backup_path = directory.path().join("synthetic-cleanup-backup");
+        std::fs::rename(&blocked_path, &backup_path).unwrap();
+        std::fs::create_dir(&blocked_path).unwrap();
+        let cleanup = if retain_text {
+            history.clear_audio(&pending_id)
+        } else {
+            history.clear_text(&pending_id)
+        };
+        assert!(cleanup.is_err());
+        assert!(finalize_pending_history(
+            &history,
+            &pending_id,
+            200,
+            false,
+            retain_text,
+            retain_audio,
+        )
+        .is_err());
+        assert!(!directory.path().join(format!("{pending_id}.json")).exists());
+
+        std::fs::remove_dir(&blocked_path).unwrap();
+        std::fs::rename(&backup_path, &blocked_path).unwrap();
+        assert!(finalize_pending_history(
+            &history,
+            &pending_id,
+            200,
+            false,
+            retain_text,
+            retain_audio,
+        )
+        .unwrap());
+        let page = history.page(&pending_id, "", 0).unwrap();
+        assert_eq!(page.total, if retain_text { 2 } else { 0 });
+        if retain_text {
+            assert_eq!(page.entries[0].audio_source, AudioSource::Microphone);
+            assert_eq!(page.entries[1].audio_source, AudioSource::System);
+        } else {
+            assert!(history.export_transcript(&pending_id).is_err());
+        }
+        assert_eq!(
+            history.audio_sources(&pending_id).unwrap(),
+            if retain_audio {
+                vec![AudioSource::System, AudioSource::Microphone]
+            } else {
+                Vec::new()
+            }
+        );
+        for source in [AudioSource::System, AudioSource::Microphone] {
+            assert_eq!(
+                history.audio_from(&pending_id, source).is_ok(),
+                retain_audio
+            );
+        }
+        assert_eq!(
+            history.export_transcript(&saved_id).unwrap(),
+            saved_transcript
+        );
+        assert_eq!(
+            history
+                .audio_from(&saved_id, AudioSource::Microphone)
+                .unwrap(),
+            saved_audio
+        );
+    }
+
+    #[test]
+    fn pending_text_opt_out_retries_failed_cleanup_before_finalization() {
+        verify_failed_opt_out_cleanup_is_retried(false, true);
+    }
+
+    #[test]
+    fn pending_audio_opt_out_retries_failed_cleanup_before_finalization() {
+        verify_failed_opt_out_cleanup_is_retried(true, false);
+    }
 
     #[test]
     fn application_target_validation_is_bounded_and_ui_fixtures_never_probe_os_support() {
