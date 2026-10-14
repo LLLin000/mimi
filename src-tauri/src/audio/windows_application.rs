@@ -9,7 +9,7 @@ use std::sync::{
     mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
-use windows::core::{implement, AgileReference, Interface, Ref, HRESULT};
+use windows::core::{implement, Interface, Ref, HRESULT};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
@@ -173,12 +173,22 @@ impl WindowsApplicationCapture {
     }
 }
 
+// ActivateCompleted runs in the process MTA, as does our explicitly initialized
+// capture worker. COM permits interface transfer within that one apartment
+// without marshaling. Keep this private and Send-only: the callback transfers
+// ownership once; all subsequent audio calls and releases belong to the worker.
+// An agile reference would require a proxy for the local IAudioClient interface.
+struct MtaAudioClient(IAudioClient);
+// SAFETY: the only producer and consumer below are COM-initialized MTA threads.
+// A failed channel send releases the interface on the MTA callback thread.
+unsafe impl Send for MtaAudioClient {}
+
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct Activation {
     // Windows retains the completion handler until activation finishes, so
     // cancellation cannot outlive the process-loopback parameter storage.
     params: AUDIOCLIENT_ACTIVATION_PARAMS,
-    tx: Mutex<Option<mpsc::Sender<windows::core::Result<AgileReference<IAudioClient>>>>>,
+    tx: Mutex<Option<mpsc::Sender<windows::core::Result<MtaAudioClient>>>>,
 }
 impl IActivateAudioInterfaceCompletionHandler_Impl for Activation_Impl {
     fn ActivateCompleted(
@@ -197,8 +207,7 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activation_Impl {
             let client: IAudioClient = unknown
                 .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?
                 .cast()?;
-            // Use COM's agile reference to marshal the result to our worker.
-            AgileReference::new(&client)
+            Ok(MtaAudioClient(client))
         })();
         if let Some(tx) = self.tx.lock().unwrap().take() {
             let _ = tx.send(result);
@@ -239,7 +248,12 @@ fn open(
         tx: Mutex::new(Some(tx)),
     });
     let params = &activation.get().params;
-    let variant = PROPVARIANT {
+    // `blob.pBlobData` borrows `activation`'s storage; it is not a CoTaskMem
+    // allocation. `Drop for PROPVARIANT` calls `PropVariantClear`, which frees
+    // VT_BLOB payloads with `CoTaskMemFree`, so the variant must never be
+    // cleared. Keep the payload alive until activation completes by holding
+    // `activation` (dropped after `_operation`).
+    let variant = std::mem::ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_BLOB,
@@ -252,13 +266,13 @@ fn open(
                 ..Default::default()
             }),
         },
-    };
+    });
     let handler = activation.to_interface::<IActivateAudioInterfaceCompletionHandler>();
     let _operation = unsafe {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(&variant),
+            Some(&*variant),
             &handler,
         )
     }
@@ -274,7 +288,7 @@ fn open(
         match rx.recv_timeout(POLL) {
             Ok(result) => {
                 break result
-                    .and_then(|client| client.resolve())
+                    .map(|client| client.0)
                     .map_err(|_| SystemAudioCaptureError::NativeStartFailed)?
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}

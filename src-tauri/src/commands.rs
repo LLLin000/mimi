@@ -2586,15 +2586,23 @@ pub fn overlay_control_set_popup_bounds(
 
 /// Applies a tightly-fitted panel height measured by the control WebView.
 #[tauri::command]
-pub fn overlay_control_set_panel_height(app: AppHandle, height: f64) -> Result<(), String> {
-    OverlayControlWindowManager::set_panel_height(&app, height);
+pub fn overlay_control_set_panel_height(
+    app: AppHandle,
+    height: f64,
+    pixel_ratio: f64,
+) -> Result<(), String> {
+    OverlayControlWindowManager::set_panel_height(&app, height, pixel_ratio);
     Ok(())
 }
 
 /// Applies the collapsed capsule's content width independently of its panel.
 #[tauri::command]
-pub fn overlay_control_set_island_width(app: AppHandle, width: f64) -> Result<(), String> {
-    OverlayControlWindowManager::set_island_width(&app, width);
+pub fn overlay_control_set_island_width(
+    app: AppHandle,
+    width: f64,
+    pixel_ratio: f64,
+) -> Result<(), String> {
+    OverlayControlWindowManager::set_island_width(&app, width, pixel_ratio);
     Ok(())
 }
 

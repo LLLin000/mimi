@@ -327,6 +327,7 @@ struct OverlayControlStateInner {
     mode: OverlayControlMode,
     island_width: f64,
     panel_height: f64,
+    webview_zoom: f64,
     generation: u64,
 }
 
@@ -405,6 +406,7 @@ impl Default for OverlayControlState {
             mode: OverlayControlMode::Hidden,
             island_width: OverlayControlWindowManager::DEFAULT_ISLAND_WIDTH,
             panel_height: OverlayControlWindowManager::DEFAULT_PANEL_HEIGHT,
+            webview_zoom: 1.0,
             generation: 0,
         }))
     }
@@ -430,26 +432,28 @@ impl OverlayControlState {
         true
     }
 
-    fn set_panel_height(&self, height: f64) -> bool {
+    fn set_panel_height(&self, height: f64, zoom: f64) -> bool {
         let mut state = self.0.lock().unwrap();
-        if (state.panel_height - height).abs() < 0.5 {
+        if (state.panel_height - height).abs() < 0.5 && (state.webview_zoom - zoom).abs() < 0.0001 {
             return false;
         }
         state.panel_height = height;
+        state.webview_zoom = zoom;
         true
     }
 
-    fn dimensions(&self) -> (f64, f64) {
+    fn dimensions(&self) -> (f64, f64, f64) {
         let state = self.0.lock().unwrap();
-        (state.island_width, state.panel_height)
+        (state.island_width, state.panel_height, state.webview_zoom)
     }
 
-    fn set_island_width(&self, width: f64) -> bool {
+    fn set_island_width(&self, width: f64, zoom: f64) -> bool {
         let mut state = self.0.lock().unwrap();
-        if (state.island_width - width).abs() < 0.5 {
+        if (state.island_width - width).abs() < 0.5 && (state.webview_zoom - zoom).abs() < 0.0001 {
             return false;
         }
         state.island_width = width;
+        state.webview_zoom = zoom;
         true
     }
 
@@ -1820,7 +1824,7 @@ fn reconcile_linux_overlay_input(
     let control = if OverlayControlWindowManager::is_embedded(app) {
         let (width, height) = window.as_ref().size();
         app.try_state::<OverlayControlState>().and_then(|state| {
-            let (island_width, panel_height) = state.dimensions();
+            let (island_width, panel_height, _) = state.dimensions();
             embedded_control_geometry(state.mode(), island_width, panel_height, width, height).map(
                 |geometry| {
                     gtk::cairo::RectangleInt::new(
@@ -2299,6 +2303,18 @@ impl LogicalWorkArea {
     fn coordinate_distance(self, logical: f64) -> f64 {
         logical * self.coordinate_scale
     }
+
+    /// CSS pixels also include WebView zoom (including Windows text scaling).
+    /// Preserve the physical work area while expressing its bounds in CSS units.
+    #[cfg(any(target_os = "windows", test))]
+    fn with_webview_zoom(self, zoom: f64) -> Self {
+        Self {
+            width: self.width / zoom,
+            height: self.height / zoom,
+            coordinate_scale: self.coordinate_scale * zoom,
+            ..self
+        }
+    }
 }
 
 fn logical_work_area(monitor: &tauri::Monitor) -> LogicalWorkArea {
@@ -2704,15 +2720,18 @@ impl OverlayControlWindowManager {
 
     /// Updates the tightly-fitted panel height measured by React. The value is
     /// clamped before any native window mutation.
-    pub fn set_panel_height(app: &AppHandle, height: f64) {
+    pub fn set_panel_height(app: &AppHandle, height: f64, pixel_ratio: f64) {
         if !height.is_finite() {
             return;
         }
         let height = height.clamp(Self::MIN_PANEL_HEIGHT, Self::MAX_PANEL_HEIGHT);
+        let Some(zoom) = measured_webview_zoom(app, pixel_ratio) else {
+            return;
+        };
         let Some(state) = app.try_state::<OverlayControlState>() else {
             return;
         };
-        if state.set_panel_height(height) && state.mode() == OverlayControlMode::Panel {
+        if state.set_panel_height(height, zoom) && state.mode() == OverlayControlMode::Panel {
             Self::apply_geometry(app, OverlayControlMode::Panel);
         }
     }
@@ -2720,16 +2739,19 @@ impl OverlayControlWindowManager {
     /// Caches the collapsed capsule's intrinsic width independently of the
     /// panel. Hidden and expanded surfaces only remember this measurement;
     /// a late report must neither reveal a hidden window nor shrink a panel.
-    pub fn set_island_width(app: &AppHandle, width: f64) {
+    pub fn set_island_width(app: &AppHandle, width: f64, pixel_ratio: f64) {
         let Some(width) = measured_island_width(width) else {
             return;
         };
         let current_app = app.clone();
         let _ = app.run_on_main_thread(move || {
+            let Some(zoom) = measured_webview_zoom(&current_app, pixel_ratio) else {
+                return;
+            };
             let Some(state) = current_app.try_state::<OverlayControlState>() else {
                 return;
             };
-            if state.set_island_width(width) && state.mode() == OverlayControlMode::Island {
+            if state.set_island_width(width, zoom) && state.mode() == OverlayControlMode::Island {
                 Self::apply_geometry(&current_app, OverlayControlMode::Island);
             }
         });
@@ -2836,10 +2858,14 @@ impl OverlayControlWindowManager {
         let Some((anchor_x, anchor_y, work_area)) = Self::overlay_anchor(app) else {
             return false;
         };
-        let (island_width, panel_height) = app
+        let (island_width, panel_height, zoom) = app
             .try_state::<OverlayControlState>()
             .map(|state| state.dimensions())
-            .unwrap_or((Self::DEFAULT_ISLAND_WIDTH, Self::DEFAULT_PANEL_HEIGHT));
+            .unwrap_or((Self::DEFAULT_ISLAND_WIDTH, Self::DEFAULT_PANEL_HEIGHT, 1.0));
+        #[cfg(target_os = "windows")]
+        let work_area = work_area.with_webview_zoom(zoom);
+        #[cfg(not(target_os = "windows"))]
+        let _ = zoom;
         let geometry = overlay_control_geometry(
             mode,
             anchor_x,
@@ -2854,8 +2880,6 @@ impl OverlayControlWindowManager {
             let native_window = window.clone();
             let _ = window.run_on_main_thread(move || {
                 if let Ok(window) = native_window.gtk_window() {
-                    // A non-resizable GTK window otherwise retains its
-                    // natural 200px height and intercepts invisible clicks.
                     window.set_size_request(geometry.width as i32, geometry.height as i32);
                     window.resize(geometry.width as i32, geometry.height as i32);
                     window.move_(geometry.x.round() as i32, geometry.y.round() as i32);
@@ -2951,6 +2975,25 @@ fn control_mode_for_presentation(
         OverlayControlMode::Panel
     } else {
         OverlayControlMode::Island
+    }
+}
+
+fn measured_webview_zoom(app: &AppHandle, pixel_ratio: f64) -> Option<f64> {
+    if !pixel_ratio.is_finite() || !(0.25..=16.0).contains(&pixel_ratio) {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let native_scale = app
+            .get_webview_window("overlay-control")?
+            .scale_factor()
+            .ok()?;
+        Some(pixel_ratio / native_scale)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Some(1.0)
     }
 }
 
@@ -4045,15 +4088,17 @@ mod geometry_tests {
     #[test]
     fn measured_width_updates_keep_hidden_and_panel_modes_and_dismiss_generation() {
         let state = OverlayControlState::default();
-        assert!(state.set_island_width(148.0));
+        assert!(state.set_island_width(148.0, 1.0));
         assert_eq!(state.snapshot(), (OverlayControlMode::Hidden, 270.0, 0));
-        assert_eq!(state.dimensions(), (148.0, 270.0));
+        assert_eq!(state.dimensions(), (148.0, 270.0, 1.0));
         assert!(state.set_mode(OverlayControlMode::Panel));
-        assert!(state.set_panel_height(356.0));
-        assert!(state.set_island_width(312.0));
-        assert!(!state.set_island_width(312.0));
+        assert!(state.set_panel_height(356.0, 1.0));
+        assert!(state.set_island_width(312.0, 1.0));
+        assert!(!state.set_island_width(312.0, 1.0));
         assert_eq!(state.snapshot(), (OverlayControlMode::Panel, 356.0, 1));
-        assert_eq!(state.dimensions(), (312.0, 356.0));
+        assert_eq!(state.dimensions(), (312.0, 356.0, 1.0));
+        assert!(state.set_island_width(312.0, 1.2));
+        assert_eq!(state.dimensions(), (312.0, 356.0, 1.2));
     }
 
     #[test]
@@ -4096,6 +4141,60 @@ mod geometry_tests {
             narrow,
         );
         assert_eq!((island.x, island.y, island.width), (108.0, 160.0, 84.0));
+    }
+
+    #[test]
+    fn zoomed_controls_fit_css_content_without_changing_monitor_bounds() {
+        for monitor_scale in [1.0, 1.5, 2.0] {
+            let monitor = LogicalWorkArea {
+                x: -1920.0,
+                y: 80.0,
+                width: 1280.0,
+                height: 720.0,
+                coordinate_scale: monitor_scale,
+            };
+            for zoom in [1.0, 1.2, 1.5] {
+                let css_area = monitor.with_webview_zoom(zoom);
+                assert!((css_area.coordinate_width() - monitor.coordinate_width()).abs() < 0.001);
+                assert!((css_area.coordinate_height() - monitor.coordinate_height()).abs() < 0.001);
+                for mode in [OverlayControlMode::Island, OverlayControlMode::Panel] {
+                    let geometry = overlay_control_geometry(
+                        mode,
+                        monitor.x + 100.0,
+                        monitor.y + 100.0,
+                        148.0,
+                        356.0,
+                        css_area,
+                    );
+                    let (css_width, css_height) = match mode {
+                        OverlayControlMode::Island => (148.0, 30.0),
+                        _ => (280.0, 356.0),
+                    };
+                    assert!(
+                        (geometry.width * css_area.coordinate_scale
+                            - css_width * monitor_scale * zoom)
+                            .abs()
+                            < 0.001
+                    );
+                    assert!(
+                        (geometry.height * css_area.coordinate_scale
+                            - css_height * monitor_scale * zoom)
+                            .abs()
+                            < 0.001
+                    );
+                    assert!(geometry.x >= monitor.x);
+                    assert!(geometry.y >= monitor.y);
+                    assert!(
+                        geometry.x + geometry.width * css_area.coordinate_scale
+                            <= monitor.x + monitor.coordinate_width()
+                    );
+                    assert!(
+                        geometry.y + geometry.height * css_area.coordinate_scale
+                            <= monitor.y + monitor.coordinate_height()
+                    );
+                }
+            }
+        }
     }
 }
 
