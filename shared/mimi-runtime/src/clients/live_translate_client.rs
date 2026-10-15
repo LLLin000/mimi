@@ -1228,6 +1228,7 @@ mod tests {
         let fixtures: serde_json::Value =
             serde_json::from_str(include_str!("../../../live-pair-contracts.json")).unwrap();
         let ids = [
+            "late_response_uses_exact_source_identity_and_orphan_final_never_guesses",
             "late_previous_source_final_preserves_new_pending_final",
             "legacy_next_translation_waits_for_unobserved_source_after_retirement",
             "legacy_empty_source_final_does_not_move_current_back",

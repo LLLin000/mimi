@@ -434,9 +434,15 @@ impl SessionHistory {
         if self.disabled {
             return Err(io::Error::new(io::ErrorKind::NotFound, "history disabled"));
         }
-        let wav_path = self.audio_path(id, source, "wav")?;
-        if !wav_path.is_file() {
-            let mut file = fs::File::open(self.audio_path(id, source, "pcm")?)?;
+        // Until finalization consumes the journal, it is the authoritative
+        // track. A failed conversion may leave an invalid or stale WAV beside
+        // it; only an absent journal permits reading the finalized output.
+        let pcm = match fs::File::open(self.audio_path(id, source, "pcm")?) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(mut file) = pcm {
             if file.metadata()?.len() > AUDIO_BYTE_LIMIT as u64 + 4 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -455,7 +461,7 @@ impl SessionHistory {
             file.read_to_end(&mut audio)?;
             return Ok(audio);
         }
-        let mut file = fs::File::open(wav_path)?;
+        let mut file = fs::File::open(self.audio_path(id, source, "wav")?)?;
         if file.metadata()?.len() > crate::core::session_archive::AUDIO_BYTE_LIMIT as u64 + 44 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -868,6 +874,62 @@ mod tests {
         );
         assert!(history.path(id, "jsonl").unwrap().is_file());
         assert!(!history.path(id, "json").unwrap().exists());
+    }
+
+    #[test]
+    fn pending_audio_export_uses_pcm_after_a_failed_wav_finalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        let mut stale_wav = synthetic_wav(16_000);
+        stale_wav[44] ^= 1;
+        for source in [AudioSource::System, AudioSource::Microphone] {
+            for damaged_wav in [
+                Vec::new(),
+                b"damaged audio".to_vec(),
+                synthetic_wav(24_000),
+                stale_wav.clone(),
+            ] {
+                let id = pending_audio(&history, source, 16_000);
+                let wav_path = history.audio_path(&id, source, "wav").unwrap();
+                fs::write(&wav_path, &damaged_wav).unwrap();
+                assert!(history.finalize(&id, 200, false).is_err());
+                assert_pending_audio(&history, &id, source, 16_000);
+
+                // A failed conversion must not make its output shadow the
+                // complete original journal in playback or manual export.
+                assert_eq!(
+                    history.audio_selected(&id, Some(source)).unwrap(),
+                    synthetic_wav(16_000)
+                );
+                assert_eq!(fs::read(&wav_path).unwrap(), damaged_wav);
+                assert_pending_audio(&history, &id, source, 16_000);
+                history.clear_audio(&id).unwrap();
+                assert!(history.audio_selected(&id, Some(source)).is_err());
+                assert_eq!(history.page(&id, "", 0).unwrap().total, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_pending_pcm_cannot_fall_back_to_an_existing_wav() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = SessionHistory::new(directory.path().join("history"), false);
+        for source in [AudioSource::System, AudioSource::Microphone] {
+            let id = pending_audio(&history, source, 16_000);
+            fs::write(
+                history.audio_path(&id, source, "wav").unwrap(),
+                synthetic_wav(16_000),
+            )
+            .unwrap();
+            let pcm_path = history.audio_path(&id, source, "pcm").unwrap();
+            let mut odd_pcm = 16_000_u32.to_le_bytes().to_vec();
+            odd_pcm.push(1);
+            for invalid_pcm in [48_000_u32.to_le_bytes().to_vec(), odd_pcm] {
+                fs::write(&pcm_path, &invalid_pcm).unwrap();
+                assert!(history.audio_from(&id, source).is_err());
+                assert_eq!(fs::read(&pcm_path).unwrap(), invalid_pcm);
+            }
+        }
     }
 
     #[test]

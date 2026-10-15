@@ -224,7 +224,10 @@ impl LivePairAligner {
                     return vec![event.clone()];
                 };
                 let Some(source_id) = self.responses.get(response_id).cloned() else {
-                    return vec![event.clone()];
+                    // Retired or unknown responses still have an identity.
+                    // Dropping that identity would let a late draft replace
+                    // the translation belonging to the current source.
+                    return Vec::new();
                 };
                 if self.discarded_items.contains(&source_id) {
                     return Vec::new();
@@ -443,6 +446,77 @@ mod tests {
             item_id: Some(item.into()),
             previous_item_id: previous.map(String::from),
         }
+    }
+
+    #[test]
+    fn an_orphaned_translation_draft_cannot_replace_the_current_identified_translation() {
+        let mut aligner = LivePairAligner::default();
+        let mut reducer = crate::SubtitleReducer::<crate::NoopArchive>::new(6);
+        for (event, identity) in [
+            (
+                LivePairEvent::ItemCreated,
+                identity("response-a", Some("source-a")),
+            ),
+            (
+                LivePairEvent::SourceFinal {
+                    text: "Synthetic first sentence.".into(),
+                    language: Some("en".into()),
+                },
+                identity("source-a", None),
+            ),
+            (
+                LivePairEvent::TranslationFinal {
+                    text: "Synthetic first translation.".into(),
+                },
+                identity("response-a", None),
+            ),
+            (
+                LivePairEvent::ItemCreated,
+                identity("response-b", Some("source-b")),
+            ),
+            (
+                LivePairEvent::SourceDraft {
+                    text: "Synthetic current sentence".into(),
+                    language: Some("en".into()),
+                },
+                identity("source-b", None),
+            ),
+            (
+                LivePairEvent::TranslationDraft {
+                    text: "Synthetic current translation".into(),
+                },
+                identity("response-b", None),
+            ),
+        ] {
+            for output in aligner.observe_at(&event, &identity, 0) {
+                if let Some(event) = output.subtitle_event() {
+                    reducer.apply(event);
+                }
+            }
+        }
+        let before = reducer.snapshot.clone();
+        for orphan in ["response-a", "unknown-response"] {
+            for output in aligner.observe_at(
+                &LivePairEvent::TranslationDraft {
+                    text: "Synthetic orphaned translation".into(),
+                },
+                &identity(orphan, None),
+                1,
+            ) {
+                if let Some(event) = output.subtitle_event() {
+                    reducer.apply(event);
+                }
+            }
+            assert_eq!(reducer.snapshot, before, "orphan response {orphan}");
+        }
+        // The compatibility path remains available only when no identity exists.
+        let legacy = LivePairEvent::TranslationDraft {
+            text: "Synthetic legacy draft".into(),
+        };
+        assert_eq!(
+            aligner.observe_at(&legacy, &LivePairIdentity::default(), 2),
+            vec![legacy]
+        );
     }
 
     #[test]

@@ -199,6 +199,23 @@
         {
           "event": {
             "type": "translation_draft",
+            "text": "Synthetic unlinked translation draft"
+          },
+          "identity": {
+            "item_id": "unknown-response",
+            "previous_item_id": null
+          },
+          "atNs": 11500000,
+          "providerFrame": {
+            "type": "response.text.text",
+            "text": "Synthetic unlinked translation draft",
+            "item_id": "unknown-response"
+          },
+          "expected": []
+        },
+        {
+          "event": {
+            "type": "translation_draft",
             "text": "第一句"
           },
           "identity": {
@@ -247,6 +264,23 @@
               "utterance_id": "source-a"
             }
           ]
+        },
+        {
+          "event": {
+            "type": "translation_draft",
+            "text": "Synthetic retired translation draft"
+          },
+          "identity": {
+            "item_id": "response-a",
+            "previous_item_id": null
+          },
+          "atNs": 16000000,
+          "providerFrame": {
+            "type": "response.text.text",
+            "text": "Synthetic retired translation draft",
+            "item_id": "response-a"
+          },
+          "expected": []
         }
       ]
     },
