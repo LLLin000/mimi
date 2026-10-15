@@ -57,6 +57,89 @@ beforeEach(async () => {
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); vi.useRealTimers(); });
 
+it("pauses archive polling while its page is hidden and refreshes immediately on return", async () => {
+  await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+  const reads = ipc.sessionArchiveState.mock.calls.length;
+  await flush(5000);
+  expect(ipc.sessionArchiveState).toHaveBeenCalledTimes(reads);
+  ipc.sessionArchiveState.mockResolvedValue({ transcriptCount: 7, audioBytes: 0 });
+  await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+  expect(ipc.sessionArchiveState).toHaveBeenCalledTimes(reads + 1);
+  expect(host.querySelector(".session-transcript__heading")?.textContent).toContain(I18N.settings.transcriptCount(7));
+});
+
+it("does not start archive polling for an initially hidden page", async () => {
+  await act(async () => root.render(null));
+  ipc.sessionArchiveState.mockClear();
+  await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+  await flush(5000);
+  expect(ipc.sessionArchiveState).not.toHaveBeenCalled();
+});
+
+it("discards an archive read from the previous page visit", async () => {
+  const old = deferred();
+  ipc.sessionArchiveState.mockReturnValueOnce(old.promise);
+  await flush(1000);
+  await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+  ipc.sessionArchiveState.mockResolvedValue({ transcriptCount: 7, audioBytes: 0 });
+  await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+  await act(async () => old.resolve({ transcriptCount: 99, audioBytes: 0 }));
+  expect(host.querySelector(".session-transcript__heading")?.textContent).toContain(I18N.settings.transcriptCount(7));
+});
+
+it("bounds playback reads across repeated clicks and permits retry after failure", async () => {
+  const objectUrl = vi.fn(() => "blob:synthetic-A");
+  vi.stubGlobal("URL", Object.assign(class extends URL {}, { createObjectURL: objectUrl, revokeObjectURL: vi.fn() }));
+  try {
+    ipc.sessionHistoryList.mockResolvedValue([{ id: "A", count: 1, hasAudio: true, startedAtMs: 1_700_000_000_000 }]);
+    await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+    await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+    await select(1);
+    const pending = deferred();
+    ipc.sessionHistoryAudio.mockReturnValue(pending.promise);
+    const play = button(I18N.settings.historyPlayAudio);
+    await act(async () => { play.click(); play.click(); });
+    await click(play);
+    expect(ipc.sessionHistoryAudio).toHaveBeenCalledTimes(1);
+    expect(play.disabled).toBe(true);
+    expect(play.getAttribute("aria-busy")).toBe("true");
+    await act(async () => pending.reject(new Error("synthetic failure")));
+    expect(play.disabled).toBe(false);
+    expect(host.textContent).toContain(I18N.settings.historyAudioFailed);
+    ipc.sessionHistoryAudio.mockResolvedValueOnce(new ArrayBuffer(4));
+    await click(play);
+    expect(ipc.sessionHistoryAudio).toHaveBeenCalledTimes(2);
+    expect(host.querySelector("audio")?.src).toBe("blob:synthetic-A");
+    expect(host.textContent).not.toContain(I18N.settings.historyAudioFailed);
+  } finally { await act(() => root.render(null)); vi.unstubAllGlobals(); }
+});
+
+it("finishes a stale playback read before allowing another selection to load", async () => {
+  const objectUrl = vi.fn(() => "blob:synthetic-B");
+  vi.stubGlobal("URL", Object.assign(class extends URL {}, { createObjectURL: objectUrl, revokeObjectURL: vi.fn() }));
+  try {
+    ipc.sessionHistoryList.mockResolvedValue(["A", "B"].map(id => ({ id, count: 1, hasAudio: true, startedAtMs: 1_700_000_000_000 })));
+    await act(async () => root.render(<><SessionExport visible={false} /><SettingsToastRegion /></>));
+    await act(async () => root.render(<><SessionExport visible /><SettingsToastRegion /></>)); await flush();
+    await select(1);
+    const old = deferred();
+    ipc.sessionHistoryAudio.mockReturnValueOnce(old.promise);
+    await click(button(I18N.settings.historyPlayAudio));
+    await select(2);
+    const play = button(I18N.settings.historyPlayAudio);
+    expect(play.disabled).toBe(true);
+    await click(play);
+    expect(ipc.sessionHistoryAudio).toHaveBeenCalledTimes(1);
+    await act(async () => old.resolve(new ArrayBuffer(4)));
+    expect(objectUrl).not.toHaveBeenCalled();
+    expect(play.disabled).toBe(false);
+    ipc.sessionHistoryAudio.mockResolvedValueOnce(new ArrayBuffer(4));
+    await click(play);
+    expect(ipc.sessionHistoryAudio).toHaveBeenLastCalledWith("B", "system");
+    expect(host.querySelector("audio")?.src).toBe("blob:synthetic-B");
+  } finally { await act(() => root.render(null)); vi.unstubAllGlobals(); }
+});
+
 describe("history operation state", () => {
   it.each([false, null, true, "failure"])("retains query, page and transcript after export outcome %s", async (outcome) => {
     await select(1); await search("Synthetic"); await click(button(I18N.settings.transcriptNext)); await flush(180);

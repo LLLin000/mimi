@@ -795,17 +795,23 @@ fn source_capture_observation(
     })
 }
 
+/// Apply the event before capturing its shared deadline. The native timer must
+/// not race the reducer and observe a missing or previous request's deadline.
 /// A provider terminating either stream terminates the selected session.
-/// Synchronize every reducer before publishing or tearing down transports.
-fn apply_terminal_event_to_all_sources(
+fn apply_provider_event(
     controller: &mut TranslationSessionController,
+    source: AudioSource,
     event: &LiveTranslateServerEvent,
-) {
+) -> Option<Instant> {
+    controller.handle_from(source, event.clone());
     match event {
         LiveTranslateServerEvent::SessionFinished => controller.did_stop(),
         LiveTranslateServerEvent::Error { message, .. } => controller.did_fail(message.clone()),
         _ => {}
     }
+    matches!(event, LiveTranslateServerEvent::TranslationStarted)
+        .then(|| controller.translation_pending_deadline_from(source))
+        .flatten()
 }
 
 #[derive(Clone, Copy)]
@@ -3426,10 +3432,6 @@ impl SessionManager {
         if resolves_translation_timeout {
             self.cancel_source_translation_timeout(source);
         }
-        if matches!(event, LiveTranslateServerEvent::TranslationStarted) {
-            self.arm_translation_timeout(source, generation);
-        }
-
         let is_terminal = matches!(
             event,
             LiveTranslateServerEvent::Error { .. } | LiveTranslateServerEvent::SessionFinished
@@ -3442,14 +3444,13 @@ impl SessionManager {
         if is_terminal {
             self.cancel_translation_timeout();
         }
-        let newly_confirmed = {
+        let (newly_confirmed, translation_deadline) = {
             let mut controller = self.controller.lock().unwrap();
             #[cfg(any(test, feature = "development-debugger"))]
             let debug_before = crate::core::development_debug::is_enabled()
                 .then(|| controller.state.subtitles.clone());
             let previous = controller.state.subtitles.history.last().cloned();
-            controller.handle_from(source, event.clone());
-            apply_terminal_event_to_all_sources(&mut controller, &event);
+            let deadline = apply_provider_event(&mut controller, source, &event);
             #[cfg(any(test, feature = "development-debugger"))]
             if let Some(before) = debug_before {
                 crate::core::development_debug::record(
@@ -3463,10 +3464,14 @@ impl SessionManager {
                 );
             }
             let current = controller.state.subtitles.history.last();
-            confirmed_history_tail_changed(previous.as_ref(), current)
+            let confirmed = confirmed_history_tail_changed(previous.as_ref(), current)
                 .then(|| current.cloned())
-                .flatten()
+                .flatten();
+            (confirmed, deadline)
         };
+        if let Some(deadline) = translation_deadline {
+            self.arm_translation_timeout(source, generation, deadline);
+        }
         if let Some(pair) = newly_confirmed {
             let pending = self.history_pending_id.lock().unwrap();
             if let Some(id) = pending.as_deref() {
@@ -3522,7 +3527,12 @@ impl SessionManager {
     /// then waits for the server's `response.text.done`; if the audio stops
     /// mid-sentence the server may never finalize, so without this the UI
     /// would stay pending forever. The shown subtitle is left untouched.
-    fn arm_translation_timeout(self: &Arc<Self>, source: AudioSource, generation: u64) {
+    fn arm_translation_timeout(
+        self: &Arc<Self>,
+        source: AudioSource,
+        generation: u64,
+        deadline: Instant,
+    ) {
         // Install/cancel under one slot lock. Otherwise a concurrent cancel
         // can run after `spawn` but before the handle is stored, leaving a
         // detached stale handle in the slot even though its ownership id was
@@ -3537,14 +3547,6 @@ impl SessionManager {
             .store(task_id, Ordering::SeqCst);
         let this = Arc::clone(self);
         let task = tokio::spawn(async move {
-            let deadline = this
-                .controller
-                .lock()
-                .unwrap()
-                .translation_pending_deadline_from(source);
-            let Some(deadline) = deadline else {
-                return;
-            };
             tokio::time::sleep_until(deadline.into()).await;
             let _content = this.subtitle_content_lock.lock().await;
             if !this.is_generation_current(generation)
@@ -5555,6 +5557,82 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn translation_timeout_captures_the_first_and_replacement_deadline_per_source() {
+        let mut controller = TranslationSessionController::default();
+        controller.set_audio_input(AudioInput::Both);
+        controller.did_connect();
+        for source in [AudioSource::System, AudioSource::Microphone] {
+            assert!(controller
+                .translation_pending_deadline_from(source)
+                .is_none());
+            let first = apply_provider_event(
+                &mut controller,
+                source,
+                &LiveTranslateServerEvent::TranslationStarted,
+            )
+            .expect("the first timer must observe the newly applied pending request");
+            assert_eq!(
+                controller.translation_pending_deadline_from(source),
+                Some(first)
+            );
+
+            // Give the previous request a distinct deadline without sleeping.
+            controller.handle_from_at(
+                source,
+                LiveTranslateServerEvent::TranslationStarted,
+                Instant::now() - Duration::from_secs(1),
+            );
+            let previous = controller
+                .translation_pending_deadline_from(source)
+                .unwrap();
+            let replacement = apply_provider_event(
+                &mut controller,
+                source,
+                &LiveTranslateServerEvent::TranslationStarted,
+            )
+            .unwrap();
+            assert!(replacement > previous);
+            assert!(!controller.expire_translation_pending_from(source, previous));
+            assert!(controller.expire_translation_pending_from(source, replacement));
+            assert!(controller
+                .translation_pending_deadline_from(source)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn translation_timeout_deadline_is_not_rearmed_by_final_or_cancelled_content() {
+        let mut controller = TranslationSessionController::default();
+        controller.set_audio_input(AudioInput::Both);
+        controller.did_connect();
+        let system = apply_provider_event(
+            &mut controller,
+            AudioSource::System,
+            &LiveTranslateServerEvent::TranslationStarted,
+        )
+        .unwrap();
+        let microphone = apply_provider_event(
+            &mut controller,
+            AudioSource::Microphone,
+            &LiveTranslateServerEvent::TranslationStarted,
+        )
+        .unwrap();
+        assert!(apply_provider_event(
+            &mut controller,
+            AudioSource::System,
+            &LiveTranslateServerEvent::TranslationFinal("synthetic translation".into()),
+        )
+        .is_none());
+        assert!(!controller.expire_translation_pending_from(AudioSource::System, system));
+        assert_eq!(
+            controller.translation_pending_deadline_from(AudioSource::Microphone),
+            Some(microphone)
+        );
+        controller.clear_subtitles();
+        assert!(!controller.expire_translation_pending_from(AudioSource::Microphone, microphone));
+    }
+
+    #[test]
     fn either_source_finishing_or_failing_ends_all_selected_sources() {
         for source in [AudioSource::System, AudioSource::Microphone] {
             for event in [
@@ -5570,8 +5648,7 @@ mod lifecycle_tests {
                 for &input in AudioInput::Both.sources() {
                     controller.handle_from(input, LiveTranslateServerEvent::TranslationStarted);
                 }
-                controller.handle_from(source, event.clone());
-                apply_terminal_event_to_all_sources(&mut controller, &event);
+                assert!(apply_provider_event(&mut controller, source, &event).is_none());
                 assert!(!controller.state.status.is_active());
                 assert!(!controller.state.is_translation_pending);
                 assert!(controller

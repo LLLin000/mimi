@@ -45,6 +45,7 @@ export function SessionExport({ visible }: { visible: boolean }) {
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [recordingSource, setRecordingSource] = useState<AudioSource>("system");
   const [audioError, setAudioError] = useState(false);
+  const [audioLoading, setAudioLoading] = useState(false);
   const [readError, setReadError] = useState(false);
   const [busy, setBusy] = useState(false);
   const { beginToast, clearToast } = useSettingsToast();
@@ -54,6 +55,7 @@ export function SessionExport({ visible }: { visible: boolean }) {
   const transcriptRequest = useRef(0);
   const historyRequest = useRef(0);
   const audioRequest = useRef(0);
+  const audioInFlight = useRef(false);
   const interaction = useRef(0);
   const selectedHistoryId = useRef<string | null>(null);
 
@@ -82,7 +84,14 @@ export function SessionExport({ visible }: { visible: boolean }) {
   }
 
   function loadAudio(id: string) {
+    // One WAV may be 64 MiB. Superseding its result must not start another
+    // full-file transfer while the native read is still in flight.
+    if (audioInFlight.current) return;
+    audioInFlight.current = true;
+    const currentLifetime = lifetime.current;
     const request = ++audioRequest.current;
+    setAudioLoading(true);
+    setAudioError(false);
     void sessionHistoryAudio(id, selectedAudioSource).then(
       (bytes) => {
         if (request !== audioRequest.current) return;
@@ -90,30 +99,38 @@ export function SessionExport({ visible }: { visible: boolean }) {
         setAudioError(false);
       },
       () => { if (request === audioRequest.current) setAudioError(true); },
-    );
+    ).finally(() => {
+      audioInFlight.current = false;
+      if (lifetime.current === currentLifetime) setAudioLoading(false);
+    });
   }
 
   useEffect(() => {
     lifetime.current += 1;
-    if (isTauri) {
-      monitor.current = monitorSessionArchive(
-        sessionArchiveState,
-        (state) => {
-          setArchive(state);
-          setReadError(false);
-        },
-        () => setReadError(true),
-      );
-    }
     return () => {
       lifetime.current += 1;
       transcriptRequest.current += 1;
       historyRequest.current += 1;
       audioRequest.current += 1;
-      monitor.current?.stop();
-      monitor.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (!visible || !isTauri) return;
+    const current = monitorSessionArchive(
+      sessionArchiveState,
+      (state) => {
+        setArchive(state);
+        setReadError(false);
+      },
+      () => setReadError(true),
+    );
+    monitor.current = current;
+    return () => {
+      current.stop();
+      if (monitor.current === current) monitor.current = null;
+    };
+  }, [visible]);
 
   useEffect(() => {
     interaction.current += 1;
@@ -330,7 +347,7 @@ export function SessionExport({ visible }: { visible: boolean }) {
               }} />
           </SettingsRow>}
           {selected && <div className="session-history__actions" aria-busy={busy}>
-            {selected.hasAudio && (audioUrl ? <audio controls src={audioUrl} aria-label={I18N.settings.historyAudio} /> : <button type="button" className="settings-button settings-button--quiet" onClick={() => loadAudio(selected.id)}>{I18N.settings.historyPlayAudio}</button>)}
+            {selected.hasAudio && (audioUrl ? <audio controls src={audioUrl} aria-label={I18N.settings.historyAudio} /> : <button type="button" className="settings-button settings-button--quiet" disabled={audioLoading} aria-busy={audioLoading} onClick={() => loadAudio(selected.id)}>{I18N.settings.historyPlayAudio}</button>)}
             <button type="button" className="settings-button settings-button--danger settings-button--compact" disabled={busy} onClick={() => setConfirmDelete(true)}>
               <Icon name="trash" />{I18N.settings.historyDelete}
             </button>
