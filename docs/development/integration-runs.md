@@ -4,6 +4,43 @@
 实测范围和未解决项；条目是历史证据，后续任务仍须核对当前源码与设备。
 不写密钥、音频、字幕正文或个人目录，不把临时日志当作已持久归档的案例。
 
+## 2026-10-15：v1.6.3 成品验收与公开交付
+
+- 发布源码：`v1.6.3` → `fd44949d5a69a3c4af2d9526f8711c124c94be93`；
+  包含下述生命周期和资源修复，版本提交只同步版本与双语发布说明。
+  完整 `./scripts/check.sh` 通过：前端 2203 项、桌面 612 项、shared core
+  93 项及契约、runtime 785 项、JNI crate 8 项；既有 native ignored 项保留。
+- 精确源码 main 桌面 `38753595014`／Android `38753594806`，tag 桌面
+  `38754550806`／Android `38754550675` 均成功。Linux 新钥匙串用例通过；
+  Windows x64 成品及解压便携包、原生 ARM64 无安装包程序的冷启动、
+  单实例交接、托盘／会话保留及窗口恢复通过。Linux 实际安装 DEB 后与
+  AppImage 各三次启动通过；这是 Xvfb／Openbox、软件渲染及合成会话，
+  不等同于实体设备或实际服务链路。Windows 未执行 MSI／NSIS 安装升级。
+- 最终内嵌 UI-only 签名开发版通过版本、空记录页、保存字幕开关及切页保留。
+  两套正式 macOS DMG／archive 通过完整指定要求、严格签名、debugger 排除、
+  版本／架构／sealed source 与 DMG 内容一致性检查。经已获得的退出授权，
+  在 canonical 正式路径分别启动 ARM64 和 Rosetta Intel 成品，验证相同
+  空状态和导航；原正式 app 随后完整恢复，executable hash 与签名复核通过。
+  UI-only 未连接 provider 或采集声音，未覆盖原生已有录音播放、实际 Intel
+  硬件或长时内存稳定性。仍使用既有自签名分发，未获 Apple 公证；Gatekeeper
+  assessment 仍拒绝，没有更改证书、系统信任或权限设置。
+- Android 成品为 `1.6.3`／`10603`、`app.yuxino.mimi.android`，非 debug；
+  四 ABI、ELF／ZIP alignment 与 notices 检查通过。实际下载 v1.6.2 和新
+  APK 均为唯一有效 signer，证书 SHA256 同为
+  `b263d1b5ec3c43eb4f8107f438a5cbebed18f9290e56ed2e0d0ffb11e4b74ec2`。
+  本轮没有新做 Android 设备安装或真实音频验收。
+- 草稿与公开匿名下载分别核验精确 17 资产、远端 size／digest、16 条
+  SHA256SUMS、5 个实际 updater 签名，以及发布页／源码／manifest 的同一份
+  English-first／中文说明。发布前后 tag 均未移动；公开 Latest API、tag
+  manifest 和应用实际配置的 lowercase 仓库 Latest 更新入口返回同一份新
+  manifest。已按本次“发”授权公开为 Latest：
+  [v1.6.3](https://github.com/yuxino/Mimi/releases/tag/v1.6.3)。
+  浏览器确认双语说明、17 个公开资产链接和 GitHub 原生 Contributors 的
+  `yuxino` 头像加载正常。
+- GitHub 成品 size 对比 v1.6.2：全部安装／更新包变化为 −0.089064% 至
+  +0.017822%，最大字节增长为 AppImage 的 8192 bytes；Windows MSI 和
+  Android APK 大小不变。这仅是包体证据，不代表整体性能或内存改善。
+
 ## 2026-10-15：补丁版候选资源与生命周期审计
 
 - 修复源码：`2a05f15420fd75f3a8dec76b9ed60b22e4ab1a40`，基于
